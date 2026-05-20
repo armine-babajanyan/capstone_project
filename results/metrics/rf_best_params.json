@@ -1,0 +1,24 @@
+{
+  "crisis": {
+    "params": {
+      "n_estimators": 300,
+      "max_depth": 25,
+      "min_samples_split": 21,
+      "min_samples_leaf": 22,
+      "max_features": 0.5,
+      "class_weight": "balanced_subsample"
+    },
+    "cv_pr_auc": 0.4925002170909396
+  },
+  "growth": {
+    "params": {
+      "n_estimators": 200,
+      "max_depth": 25,
+      "min_samples_split": 42,
+      "min_samples_leaf": 11,
+      "max_features": 0.5,
+      "class_weight": "balanced"
+    },
+    "cv_pr_auc": 0.1604633725107841
+  }
+}

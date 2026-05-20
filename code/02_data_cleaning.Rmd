@@ -1,0 +1,238 @@
+---
+title: "Data Cleaning"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-03-29"
+---
+
+<!--
+================================================================================
+02_data_cleaning.Rmd
+
+PURPOSE:
+  Clean the merged Call Report panel from 01_data_exploration.Rmd. Remove
+  non-U.S. banks, young/short-lived banks, and tiny banks. Engineer intra-year
+  volatility features, then collapse to annual (Q4) snapshots.
+
+INPUTS:
+  - ../data/processed_data/df.rds, bank_panel.rds
+
+OUTPUTS:
+  - ../data/processed_data/df_clean.rds — cleaned annual panel (Q4 only)
+
+CLEANING STEPS:
+  1. Keep only U.S.-domiciled banks
+  2. Drop each bank's first 3 years (start-up phase)
+  3. Remove banks with < 17 quarters of data
+  4. Engineer intra-year features (QoQ changes, within-year SD, max decline)
+  5. Collapse to Q4 (year-end), drop partial 2025
+  6. Winsorise bottom 1% of assets per year
+  7. Deduplicate bank-year ties
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+library(tidyverse)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  dev = "png",
+  dpi = 300,
+  fig.path = "../results/figures/02_cleaning-"
+)
+
+# Initialize attrition tracking
+attrition <- tibble(Step = "Raw Data", Banks = 0, Observations = 0)
+```
+
+## 1. Load Libraries
+
+```{r load-libraries}
+library(lubridate)
+library(skimr)
+library(janitor)
+library(haven)
+library(readxl)
+```
+
+## 2. Load Input Data
+
+```{r load-data}
+# Merged panel and bank-level quarter counts from 01_data_exploration.Rmd
+df         <- readRDS("../data/processed_data/df.rds")
+bank_panel <- readRDS("../data/processed_data/bank_panel.rds")
+
+attrition <- bind_rows(attrition, 
+  tibble(Step = "Initial Merge", 
+         Banks = n_distinct(df$id_rssd), 
+         Observations = nrow(df)))
+```
+
+---
+
+## 3. Geographic Filter — U.S. Banks Only
+
+Foreign-chartered banks follow different regulatory standards; exclude them.
+
+```{r filter-us}
+df <- df %>%
+  filter(cntry_nm == "UNITED STATES")
+```
+
+## 4. Drop Start-Up Phase Observations
+
+Exclude each bank's first 3 years to avoid start-up growth artefacts.
+
+```{r drop-startup}
+df <- df %>%
+  mutate(
+    open_year = year(ymd(dt_open))      # Parse bank opening date
+  ) %>%
+  filter(
+    year >= open_year + 3               # Keep data >= 3 yrs post-opening
+  )
+```
+
+## 5. Remove Short-Lived Banks
+
+Banks with < 17 quarters (~4 years) lack sufficient history for rolling
+features and are likely data artefacts.
+
+```{r drop-short-lived}
+short_lived_banks <- bank_panel %>%
+  filter(quarters < 17) %>%
+  pull(id_rssd)
+
+# Drop them
+df <- df %>%
+  filter(!id_rssd %in% short_lived_banks)
+```
+
+---
+
+## 6. Engineer Intra-Year (Quarterly) Features
+
+Compute QoQ changes within each bank-year, then summarise quarterly data
+into bank-year-level volatility and stress measures:
+- `*_sd_intra`    — within-year std. dev. of each metric
+- `*_avg_yr`      — within-year mean level
+- `*_max_decline` — worst single-quarter drop
+
+Only bank-years with all 4 quarters are retained.
+
+```{r intra-year-features}
+library(data.table)
+
+dt <- as.data.table(df)
+setorder(dt, id_rssd, year, qtr)
+
+# Step 1: QoQ changes via shift() within bank-year
+dt[, `:=`(
+  assets_qoq   = assets   - shift(assets),
+  loans_qoq    = ln_tot   - shift(ln_tot),
+  deposits_qoq = deposits - shift(deposits),
+  equity_qoq   = equity   - shift(equity)
+), by = .(id_rssd, year)]
+
+# Step 2: aggregate per bank-year in one pass
+intra_year <- dt[, .(
+  n_qtrs = .N,
+  assets_sd_intra   = sd(assets,   na.rm = TRUE),
+  loans_sd_intra    = sd(ln_tot,   na.rm = TRUE),
+  deposits_sd_intra = sd(deposits, na.rm = TRUE),
+  equity_sd_intra   = sd(equity,   na.rm = TRUE),
+  assets_avg_yr     = mean(assets,   na.rm = TRUE),
+  loans_avg_yr      = mean(ln_tot,   na.rm = TRUE),
+  deposits_avg_yr   = mean(deposits, na.rm = TRUE),
+  equity_avg_yr     = mean(equity,   na.rm = TRUE),
+  assets_max_decline   = min(assets_qoq,   na.rm = TRUE),
+  loans_max_decline    = min(loans_qoq,    na.rm = TRUE),
+  deposits_max_decline = min(deposits_qoq, na.rm = TRUE),
+  equity_max_decline   = min(equity_qoq,   na.rm = TRUE)
+), by = .(id_rssd, year)][n_qtrs == 4][, n_qtrs := NULL]
+```
+
+### 6.1 Join Intra-Year Features to Main Panel
+
+```{r join-intra-year}
+df <- df %>%
+  left_join(intra_year, by = c("id_rssd", "year"))
+```
+
+---
+
+## 7. Collapse to Annual (Q4) Snapshots
+
+Retain only Q4 (year-end) rows — the regulatory reporting standard.
+Exclude 2025 as Q4 data may be incomplete.
+
+```{r q4-filter}
+# Keep only Q4 (year-end) rows
+df <- df %>%
+  filter(qtr == 4, year < 2025)
+```
+
+## 8. Winsorise Extremely Small Banks
+
+Remove bottom 1% of assets within each year — micro-banks behave
+very differently and can distort model estimates.
+
+```{r winsorise-small}
+df_clean <- df %>%
+  group_by(year) %>%
+  mutate(
+    assets_p01 = quantile(assets, 0.01, na.rm = TRUE),  # 1st-percentile cutoff
+  ) %>%
+  ungroup() %>%
+  filter(assets >= assets_p01) 
+```
+
+## 9. Deduplicate Bank-Year Records
+
+Keep the record with the largest total assets if duplicates exist.
+
+```{r deduplicate}
+df_clean <- df_clean %>%
+  arrange(id_rssd, year, desc(assets)) %>%
+  distinct(id_rssd, year, .keep_all = TRUE)
+```
+
+---
+
+## 10. Save Cleaned Dataset
+
+```{r save-clean}
+saveRDS(df_clean, "../data/processed_data/df_clean.rds")
+```
+
+---
+
+## 11. Cleaning Summary (Attrition Plot)
+
+```{r attrition-plot}
+# Final counts
+attrition <- bind_rows(attrition, 
+  tibble(Step = "Final Cleaned", 
+         Banks = n_distinct(df_clean$id_rssd), 
+         Observations = nrow(df_clean)))
+
+attrition_plot <- attrition %>%
+  mutate(Step = fct_inorder(Step)) %>%
+  pivot_longer(cols = c(Banks, Observations), names_to = "Metric", values_to = "Count") %>%
+  ggplot(aes(x = Step, y = Count, fill = Metric)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = scales::comma(Count)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, size = 3) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Data Cleaning Attrition",
+       subtitle = "Number of banks and observations remaining after cleaning stages",
+       x = NULL, y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(attrition_plot)
+ggsave("../results/figures/02_cleaning_attrition.png", plot = attrition_plot, width = 10, height = 6)
+```

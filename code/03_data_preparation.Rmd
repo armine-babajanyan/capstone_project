@@ -1,0 +1,919 @@
+
+title: "Data Preparation"
+output:
+  pdf_document:
+    latex_engine: xelatex
+date: "2026-03-17"
+
+
+<!--
+================================================================================
+03_data_preparation.Rmd
+
+PURPOSE:
+  Build the final modelling dataset from the cleaned annual panel. This
+  notebook constructs target variables (crisis indicators), engineers
+  financial ratios, rolling statistics, loan/deposit composition features,
+  growth rates, and merges macroeconomic control variables.
+
+WORKFLOW POSITION:
+  1. 01_data_exploration.Rmd
+  2. 02_data_cleaning.Rmd
+  3. **03_data_preparation.Rmd** ← (this file)
+  4. Model training scripts (XGBoost, LightGBM, Random Forest, etc.)
+
+INPUTS:
+  - ../data/processed_data/df_clean.rds     — cleaned annual panel
+  - ../data/raw_data/EDOOrders.csv           — FDIC enforcement orders
+  - ../data/raw_data/occ_old.xlsx            — OCC old enforcement actions
+  - ../data/raw_data/occ_new.csv             — OCC new enforcement actions
+  - ../data/raw_data/failures.csv            — FDIC bank failure list
+  - ../data/raw_data/macrodata.csv           — World Bank macro indicators
+  - ../data/raw_data/interest_rates.csv      — Federal Funds rate (FRED)
+
+OUTPUTS:
+  - ../data/processed_data/df_model.csv      — model-ready dataset
+
+SECTIONS:
+  A. Target variable construction (crisis flags from 4 external sources +
+     internal balance-sheet triggers)
+  B. Feature engineering (ratios, rolling stats, compositions, growth rates)
+  C. Macroeconomic variable integration
+  D. Final model dataset assembly and export
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  dev = "png",
+  dpi = 300,
+  fig.path = "../results/figures/03_prep-"
+)
+```
+
+
+## 1. Load Libraries
+
+```{r load-libraries}
+library(tidyverse)
+library(lubridate)
+library(skimr)
+library(janitor)
+library(haven)
+library(readxl)
+```
+
+## 2. Load Cleaned Panel
+
+```{r load-data}
+df_clean <- readRDS("../data/processed_data/df_clean.rds")
+```
+
+
+
+
+# Part A: Target Variable Construction — Crisis Flags
+
+The composite **`crisis`** target is built from multiple external data
+sources (regulatory enforcement orders, bank failures) and internal
+balance-sheet triggers (net loss, critically undercapitalised). Each source
+is joined to the bank panel on the *previous* year (i.e., the flag at
+year *t* indicates an event at year *t + 1*) so the model predicts future
+deterioration.
+
+## 3. FDIC Enforcement Orders (EDO)
+
+Load FDIC Enforcement & Disciplinary Orders and match them to banks via
+`id_fdic_cert`. The join uses `year == prev_year` so that a notice issued
+in year *t+1* creates a flag on year-*t* features.
+
+```{r prep-fdic-cert}
+# Ensure FDIC certificate ID is numeric for joining
+df_clean <- df_clean %>%
+  mutate(id_fdic_cert = as.numeric(id_fdic_cert))
+```
+```{r load-notices}
+# Read FDIC Enforcement & Disciplinary Orders
+notices <- read_csv("../data/raw_data/EDOOrders.csv")
+head(notices)
+```
+
+```{r parse-notice-dates}
+# Parse the order's issued date and extract the year
+notices <- notices %>%
+  mutate(
+    issued_date = as.Date(`Issued Date`),
+    year = year(issued_date)
+  )
+```
+
+```{r clean-notices}
+# Select relevant columns and rename for consistency
+notices_clean <- notices %>%
+  select(
+    id_fdic_cert = `Cert Number`,
+    year,
+    order_title = `Order Title`
+  )
+df_clean <- df_clean %>%
+  mutate(id_fdic_cert = as.numeric(id_fdic_cert))
+
+# Clean the certificate number (strip trailing semicolons) and
+# create prev_year for lead-target join logic.
+notices_clean <- notices_clean %>%
+  mutate(id_fdic_cert = str_remove(id_fdic_cert, ";$"),
+    id_fdic_cert = as.numeric(id_fdic_cert),
+    prev_year = year - 1)
+```
+
+```{r join-notices}
+# Join: match bank features at year t with notices issued at year t+1
+df_clean <- df_clean %>%
+  left_join(
+    notices_clean,
+    by = c("id_fdic_cert", "year" = "prev_year")
+  )
+```
+
+```{r create-notice-flag}
+# Binary flag: 1 if the bank received an FDIC regulatory notice, 0 otherwise
+df_clean <- df_clean %>%
+  mutate(
+    notice_flag = ifelse(is.na(order_title), 0, 1)
+  )
+```
+
+```{r count-notices}
+# Sanity check: total banks with FDIC enforcement notices
+sum(df_clean$notice_flag == 1, na.rm = TRUE)
+```
+```{r plot-notices}
+# Visualise the temporal distribution of regulatory notices
+df_clean %>%
+  group_by(year) %>%
+  summarise(notices = sum(notice_flag == 1, na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = notices)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Number of Regulatory Notices per Year",
+    x = "Year",
+    y = "Number of Notices"
+  ) +
+  theme_minimal()
+```
+
+
+## 4. OCC Enforcement Actions — Historical ("Old")
+
+Load historical OCC (Office of the Comptroller of the Currency) enforcement
+orders. These target thrift institutions and use the Docket Number as the
+join key (`id_thrift`).
+
+```{r load-occ-old}
+occ_old <- read_excel("../data/raw_data/occ_old.xlsx")
+occ_old <- occ_old %>%
+  rename(id_thrift = `Docket Number`)
+```
+```{r clean-occ-old}
+# Parse issue date (handles multiple date formats), extract year,
+# and set occ_old_order = 1 as an indicator
+occ_old_clean <- occ_old %>%
+  mutate(
+    `Issue Date` = trimws(`Issue Date`),
+    `Issue Date` = na_if(`Issue Date`, ""),
+    issue_date = parse_date_time(
+      `Issue Date`,
+      orders = c("ymd HMS", "ymd", "dmy", "mdy")
+    ),
+    issue_date = as.Date(issue_date),
+    year = year(issue_date),
+    prev_year = year - 1,
+    occ_old_order = 1
+  ) %>%
+  select(id_thrift, prev_year, occ_old_order)
+```
+```{r parse-occ-old-id}
+# Strip the leading "H" from thrift docket numbers and convert to numeric
+occ_old_clean <- occ_old_clean %>%
+  mutate(
+    id_thrift = str_remove(id_thrift, "^H"),
+    id_thrift = as.numeric(id_thrift)
+  )
+```
+
+```{r join-occ-old}
+# Join old OCC orders to the bank panel (year t features ↔ year t+1 order)
+df_clean <- df_clean %>%
+  left_join(
+    occ_old_clean,
+    by = c("id_thrift", "year" = "prev_year")
+  )
+```
+
+```{r create-occ-old-flag}
+# Binary flag for old OCC enforcement action
+df_clean <- df_clean %>%
+  mutate(
+    occ_old_flag = ifelse(is.na(occ_old_order), 0, 1)
+  )
+```
+
+```{r count-occ-old}
+# Sanity check: total banks with old OCC orders
+sum(df_clean$occ_old_flag == 1, na.rm = TRUE)
+```
+
+
+## 5. OCC Enforcement Actions — Recent ("New")
+
+Load the more recent OCC enforcement actions. These use `CharterNumber`
+(renamed to `id_occ`) as the join key.
+
+```{r load-occ-new}
+occ_new <- read.csv("../data/raw_data/occ_new.csv")
+occ_new <- occ_new %>%
+  rename(id_occ = CharterNumber)
+```
+
+```{r clean-occ-new}
+# Parse start date, extract year, create prev_year for lead-target join
+occ_new_clean <- occ_new %>%
+  mutate(
+    issue_date = parse_date_time(
+      StartDate,
+      orders = c("dmy", "mdy", "ymd")
+    ),
+    issue_date = as.Date(issue_date),
+    year = year(issue_date),
+    prev_year = year - 1,
+    occ_new_order = `Institution`
+  ) %>%
+  select(id_occ, prev_year, occ_new_order = `Institution`)
+```
+
+```{r join-occ-new}
+# Join new OCC orders to bank panel
+df_clean <- df_clean %>%
+  left_join(
+    occ_new_clean,
+    by = c("id_occ", "year" = "prev_year")
+  )
+```
+
+```{r occ-flag}
+# Binary flag for new OCC enforcement action
+df_clean <- df_clean %>%
+  mutate(
+    occ_new_flag = ifelse(is.na(occ_new_order), 0, 1)
+  )
+```
+
+```{r check-occ}
+# Sanity check: total banks with new OCC orders
+sum(df_clean$occ_new_flag == 1, na.rm = TRUE)
+```
+
+
+
+## 6. FDIC Bank Failures
+
+Load the FDIC bank failure list. A bank that fails in year *t+1*
+gets a `fail_flag = 1` on its year-*t* record.
+
+```{r load-failures}
+failures <- read.csv("../data/raw_data/failures.csv")
+failures <- failures %>%
+  rename(id_fdic_cert = CERT)
+```
+
+```{r clean-failures}
+# Parse the failure date, extract year, create prev_year for the lead join
+failures_clean <- failures %>%
+  mutate(
+    FAILDATE = trimws(FAILDATE),
+    FAILDATE = na_if(FAILDATE, ""),
+    fail_date = parse_date_time(FAILDATE, orders = c("dmy", "mdy", "ymd")),
+    fail_date = as.Date(fail_date),
+    year = year(fail_date),
+    prev_year = year-1,
+    fail = 1
+  )
+```
+
+```{r join-failures}
+# Join failures to bank panel (year t features <-> year t+1 failure)
+df_clean <- df_clean %>%
+  left_join(
+    failures_clean,
+    by = c("id_fdic_cert", "year" = "prev_year")
+  )
+```
+
+```{r create-fail-flag}
+# Binary flag: 1 if the bank failed the following year
+df_clean <- df_clean %>%
+  mutate(
+    fail_flag = ifelse(is.na(fail), 0, 1)
+  )
+```
+
+```{r count-failures}
+# Sanity check: total bank-years followed by a failure
+sum(df_clean$fail_flag == 1, na.rm = TRUE)
+```
+
+```{r plot-failures}
+# Visualise the temporal distribution of bank failures
+df_clean %>%
+  group_by(year) %>%
+  summarise(fails = sum(fail_flag == 1, na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = fails)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Number of Failures per Year",
+    x = "Year",
+    y = "Number of Failures"
+  ) +
+  theme_minimal()
+```
+
+
+
+## 7. Internal Balance-Sheet Targets
+
+### 7.1 Critically Undercapitalised Flag
+
+A bank is critically undercapitalised if its equity-to-assets ratio falls
+below 2% (the PCA threshold). Again, `lead()` shifts to the next year.
+
+```{r undercapitalized-flag}
+df_clean <- df_clean %>%
+  arrange(id_rssd, year) %>%
+  group_by(id_rssd) %>%
+  mutate(
+    equity_ratio = ifelse(assets > 0, equity / assets, NA_real_),
+    critically_undercapitalized_flag = lead(ifelse(equity_ratio < 0.02, 1, 0), 1)
+  ) %>%
+  ungroup()
+```
+
+```{r count-undercapitalized}
+sum(df_clean$critically_undercapitalized_flag == 1, na.rm = TRUE)
+```
+`
+
+
+## 8. Clean Up and Composite Crisis Target
+
+### 8.1 Drop Auxiliary Columns
+
+Remove raw text / metadata columns brought in from the external sources —
+only the binary flags are needed going forward.
+
+```{r drop-aux-cols}
+df_clean <- df_clean %>%
+  select(-c(
+    order_title,
+    occ_old_order,
+    occ_new_order,
+    CITYST,
+    FAILDATE,
+    COST,
+    FIN,
+    ID,
+    NAME,
+    QBFASSET,
+    QBFDEP,
+    RESTYPE,
+    RESTYPE1,
+    SAVR,
+    year.y,
+    fail))
+```
+
+### 8.2 Create Composite `crisis` Target
+
+A bank-year is labelled as **crisis = 1** if *any* of the six individual
+flags fire. This provides a single binary target for the downstream
+classification models.
+
+```{r create-crisis-target}
+df_clean <- df_clean %>%
+  mutate(
+    crisis = if_else(
+      if_any(c(notice_flag, occ_new_flag, occ_old_flag, fail_flag, critically_undercapitalized_flag), ~ .x == 1),
+      1L, 0L
+    )
+  )
+```
+
+
+
+
+
+## 9. Diagnostic Visualisations — Target Distribution
+
+```{r count-crisis}
+# Total crisis bank-years in the dataset
+sum(df_clean$crisis == 1, na.rm = TRUE)
+```
+
+### 9.1 Decomposition by Flag Component
+
+```{r flag-breakdown}
+p <- df_clean %>%
+  group_by(year) %>%
+  summarise(
+    `FDIC Notice`       = sum(notice_flag == 1, na.rm = TRUE),
+    `OCC Notice`        = sum(pmax(occ_old_flag, occ_new_flag, na.rm = TRUE) == 1, na.rm = TRUE),
+    `Bank Failure`      = sum(fail_flag == 1, na.rm = TRUE),
+    `Critically Undercapitalized` = sum(critically_undercapitalized_flag == 1, na.rm = TRUE),
+    `Total Flags`       = sum(crisis == 1, na.rm = TRUE)
+  ) %>%
+  mutate(year = year - 1) %>%
+  pivot_longer(-year, names_to = "Flag", values_to = "Count") %>%
+  ggplot(aes(x = year, y = Count, color = Flag)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c(
+    "Bank Failure" = "#E41A1C",
+    "Critically Undercapitalized" = "#377EB8",
+    "FDIC Notice" = "#4DAF4A",
+    "OCC Notice" = "#984EA3",
+    "Total Flags" = "lightgrey"
+  )) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    x = "Year",
+    y = "Number of Banks",
+    color = "Flag Type", 
+    title = "Flag Breakdown over Time"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "bottom",
+    
+    # 🔽 increase sizes
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 11),
+    
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+
+ggsave(
+  filename = "../results/figures/flag_breakdown.png",
+  plot = p,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r plot-p}
+p
+```
+### 9.2 Composite Crisis Count Over Time
+
+```{r plot-crisis-count}
+df_clean %>%
+  group_by(year) %>%
+  summarise(n_crisis = sum(crisis == 1, na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = n_crisis)) +
+  geom_line(color = "#3266ad", linewidth = 0.8) +
+  geom_point(color = "#3266ad", size = 2) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Number of crisis banks per year",
+    x = "Year",
+    y = "Number of banks"
+  ) +
+  theme_minimal()
+```
+
+### 9.3 Crisis vs Total Banks
+
+```{r plot-crisis-vs-total}
+# Overlay crisis banks (blue) against the total bank population (red)
+df_clean %>%
+  group_by(year) %>%
+  summarise(
+    n_crisis = sum(crisis == 1, na.rm = TRUE),
+    n_banks = n()  # total banks per year
+  ) %>%
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = n_crisis), color = "#3266ad", linewidth = 0.8) +
+  geom_line(aes(y = n_banks), color = "#e63946", linewidth = 0.8) +
+  labs(
+    title = "Number of Crisis Banks and Total Banks per Year",
+    x = "Year",
+    y = "Number of Banks",
+    caption = "Blue: crisis banks; Red: total banks"
+  ) +
+  theme_minimal()
+```
+
+### 9.4 Crisis Rate (post-1980)
+
+```{r crisis-rate}
+# Count and rate of crisis observations from 1980 onwards
+sum(df_clean$crisis == 1 & df_clean$year >= 1980, na.rm = TRUE)
+sum(df_clean$year >= 1980, na.rm = TRUE)
+sum(df_clean$crisis == 1 & df_clean$year >= 1980, na.rm = TRUE)/sum(df_clean$year >= 1980, na.rm = TRUE)
+```
+
+### 9.5 Filter to Post-1980
+
+Restrict the panel to years >= 1980 to align with macroeconomic data
+availability and regulatory regime relevance.
+
+```{r filter-post-1978}
+df_clean <- df_clean %>%
+  filter(year >= 1980)
+```
+
+
+
+
+# Part B: Macroeconomic Control Variables
+
+## 10. World Bank Macro Indicators
+
+Load annual U.S. macroeconomic series from the World Bank and join them
+to the bank panel by year. These provide system-wide context that helps
+models distinguish idiosyncratic bank distress from macro-driven stress.
+
+```{r load-macro}
+macro <- read.csv("../data/raw_data/macrodata.csv", stringsAsFactors = FALSE)
+head(macro)
+```
+
+```{r clean-macro}
+macro_clean <- macro %>%
+  # Drop metadata columns (country identifiers, time code)
+  select(-Country.Name, -Country.Code, -Time.Code) %>%
+  # Rename Time to year
+  rename(year = Time) %>%
+  # Rename World Bank indicator codes to human-readable snake_case
+  rename(
+    pop_growth     = Population.growth..annual.....SP.POP.GROW.,
+    pop_total      = Population..total..SP.POP.TOTL.,
+    gdp_per_capita = GDP.per.capita..current.US....NY.GDP.PCAP.CD.,
+    gdp            = GDP..current.US....NY.GDP.MKTP.CD.,
+    gdp_growth     = GDP.growth..annual.....NY.GDP.MKTP.KD.ZG.,
+    gdp_pc_growth  = GDP.per.capita.growth..annual.....NY.GDP.PCAP.KD.ZG.,
+    real_int_rate  = Real.interest.rate......FR.INR.RINR.,
+    inflation      = Inflation..consumer.prices..annual.....FP.CPI.TOTL.ZG.,
+    unemployment   = Unemployment..total....of.total.labor.force...national.estimate...SL.UEM.TOTL.NE.ZS.
+  ) %>%
+  # Replace World Bank missing-value marker ".." with NA, then convert to numeric
+  mutate(across(-year, ~ as.numeric(na_if(., "..")))) %>%
+  # Drop footer rows where year is NA
+  filter(!is.na(year))
+```
+
+```{r join-macro}
+# Merge macro indicators into the bank panel on year
+df_clean <- df_clean %>%
+  left_join(macro_clean, by = "year")
+```
+
+```{r check-macro}
+names(macro_clean)
+summary(macro_clean)
+```
+
+## 11. Federal Funds Rate (FRED)
+
+Load monthly Federal Funds effective rate from FRED, compute an annual
+average, and merge it into the bank panel.
+
+```{r load-rates}
+rates <- read.csv("../data/raw_data/interest_rates.csv", stringsAsFactors = FALSE)
+head(rates)
+```
+
+```{r clean-rates}
+# Convert to annual average (monthly observations -> one value per year)
+rates_clean <- rates %>%
+  mutate(
+    observation_date = as.Date(observation_date),
+    year = year(observation_date)
+  ) %>%
+  rename(fed_funds_rate = FEDFUNDS) %>%
+  group_by(year) %>%
+  summarise(fed_funds_rate = mean(fed_funds_rate, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+```{r join-rates}
+df_clean <- df_clean %>%
+  left_join(rates_clean, by = "year")
+```
+
+```{r check-rates}
+summary(rates_clean)
+```
+
+
+
+# Part C: Feature Engineering
+
+## 12. Financial Ratios
+
+Compute six core financial ratios that capture capital adequacy,
+profitability, asset quality, and funding cost.
+
+```{r financial-ratios}
+df_clean <- df_clean %>%
+  mutate(
+    # Capital Adequacy: Total Equity / Total Assets
+    capital_ratio = ifelse(assets > 0, equity / assets, NA_real_),
+
+    # Profitability: Return on Assets = Net Income / Total Assets
+    roa = ifelse(assets > 0, ytdnetinc / assets, NA_real_),
+
+    # Profitability: Return on Equity = Net Income / Total Equity
+    roe = ifelse(equity > 0, ytdnetinc / equity, NA_real_),
+
+    # Asset Quality: Non-Performing Loans / Total Loans
+    npl_ratio = ifelse(ln_tot_gross > 0, npl_tot / ln_tot_gross, NA_real_),
+
+    # Net Interest Margin: (Interest Income - Interest Expense) / Total Assets
+    nim = ifelse(assets > 0, (ytdint_inc - ytdint_exp)/ assets, NA_real_),
+
+    # Cost of Funding: Total Interest Expense / (Deposits + Other Borrowings)
+    cost_of_funding = ifelse(
+      (deposits + othbor_liab) > 0,
+      ytdint_exp / (deposits + othbor_liab),
+      NA_real_
+    )
+  )
+```
+
+```{r income-growth-flag}
+df_clean <- df_clean %>%
+  group_by(id_rssd) %>%
+  mutate(
+    growth = ifelse(
+      !is.na(lead(ytdnetinc, 1)) & !is.na(ytdnetinc) &
+      ytdnetinc > 0 &                                        # currently profitable
+      lead(ytdnetinc, 1) > 0 &                               # profitable next year
+      lead(ytdnetinc, 1) >= ytdnetinc * 1.30 &               # 30%+ income growth
+      lead(roe) - roe > 0.05,                                # 5 percentage point roe increase
+      1L, 0L
+    )
+  ) %>%
+  ungroup()
+```
+## 13. Rolling 3-Year Statistics
+
+Compute the standard deviation of key variables over a 3-year window
+(years *t*, *t-1*, *t-2*) for each bank. Higher rolling volatility may
+signal instability preceding a crisis.
+
+```{r rolling-stats}
+df_clean <- df_clean %>%
+  arrange(id_rssd, year) %>%
+  group_by(id_rssd) %>%
+  mutate(
+    #  Equity 
+    equity_sd_3y   = pmap_dbl(
+      list(equity, lag(equity, 1), lag(equity, 2)),
+      ~ sd(c(..1, ..2, ..3), na.rm = FALSE)
+    ),
+
+    #  Assets 
+    assets_sd_3y   = pmap_dbl(
+      list(assets, lag(assets, 1), lag(assets, 2)),
+      ~ sd(c(..1, ..2, ..3), na.rm = FALSE)
+    ),
+
+    #  Total Loans 
+    loans_sd_3y   = pmap_dbl(
+      list(ln_tot_gross, lag(ln_tot_gross, 1), lag(ln_tot_gross, 2)),
+      ~ sd(c(..1, ..2, ..3), na.rm = FALSE)
+    ),
+
+    #  Deposits 
+    deposits_sd_3y   = pmap_dbl(
+      list(deposits, lag(deposits, 1), lag(deposits, 2)),
+      ~ sd(c(..1, ..2, ..3), na.rm = FALSE)
+    ),
+
+    #  Net Income (earnings volatility proxy) 
+    netinc_sd_3y   = pmap_dbl(
+      list(ytdnetinc, lag(ytdnetinc, 1), lag(ytdnetinc, 2)),
+      ~ sd(c(..1, ..2, ..3), na.rm = FALSE)
+    ),
+
+    #  ROA (return on assets) 
+    roa_sd_3y   = pmap_dbl(
+      list(roa, lag(roa, 1), lag(roa, 2)),
+      ~ sd(c(..1, ..2, ..3), na.rm = FALSE)
+    )
+  ) %>%
+  ungroup()
+```
+
+## 14. Loan Composition
+
+Fraction of total gross loans allocated to each major loan category.
+Concentration in a single loan type (e.g., real estate) is a known risk
+factor.
+
+```{r loan-proportions}
+df_clean <- df_clean %>%
+  mutate(
+    prop_ln_re   = ifelse(ln_tot_gross > 0, ln_re / ln_tot_gross, NA_real_),   # Real estate
+    prop_ln_ci   = ifelse(ln_tot_gross > 0, ln_ci / ln_tot_gross, NA_real_),   # Commercial & industrial
+    prop_ln_cons = ifelse(ln_tot_gross > 0, ln_cons / ln_tot_gross, NA_real_), # Consumer
+    prop_ln_agr  = ifelse(ln_tot_gross > 0, ln_agr / ln_tot_gross, NA_real_),  # Agriculture
+    prop_ln_cc = ifelse(ln_tot_gross > 0, ln_cc / ln_tot_gross, NA_real_),  # Credit cards
+    prop_ln_fi = ifelse(ln_tot_gross > 0, ln_fi / ln_tot_gross, NA_real_)  # Financial Institutions
+  )
+```
+
+## 15. Deposit Composition
+
+Proportion of demand (non-interest-bearing) deposits in total deposits.
+Banks heavily reliant on volatile demand deposits may face liquidity risk.
+
+```{r deposit-proportions}
+df_clean <- df_clean %>%
+  mutate(
+    prop_demand_dep = ifelse(deposits > 0, demand_deposits / deposits, NA_real_),
+  )
+```
+
+## 16. Year-over-Year Growth Rates and Ratio Changes
+
+Captures the direction and magnitude of balance-sheet expansion or
+contraction. Rapid asset/loan growth may precede credit-quality problems;
+declining ratios may signal deterioration.
+
+```{r growth-rates}
+df_clean <- df_clean %>%
+  arrange(id_rssd, year) %>%
+  group_by(id_rssd) %>%
+  mutate(
+    # Percentage growth rates (YoY)
+    asset_growth    = (assets       - lag(assets))       / lag(assets),
+    deposit_growth  = (deposits     - lag(deposits))     / lag(deposits),
+    loan_growth     = (ln_tot_gross - lag(ln_tot_gross)) / lag(ln_tot_gross),
+    liab_growth     = (liab_tot     - lag(liab_tot))     / lag(liab_tot),
+    equity_growth   = (equity       - lag(equity))       / lag(equity),
+
+    # Year-over-year changes in financial ratios (percentage-point changes)
+    capital_ratio_chg   = capital_ratio   - lag(capital_ratio),
+    roa_chg             = roa             - lag(roa),
+    roe_chg             = roe             - lag(roe),
+    nim_chg             = nim             - lag(nim),
+    cost_of_funding_chg = cost_of_funding - lag(cost_of_funding),
+    npl_chg = npl_ratio - lag(npl_ratio)
+  ) %>%
+  ungroup()
+```
+
+## 17. Bank Age
+
+```{r bank-age}
+# Bank age: number of years since the bank's charter/opening date
+df_clean <- df_clean %>%
+  mutate(age = year - open_year)
+```
+
+## 18. Outlier Capping (Winsorisation)
+
+Cap extreme ratio and growth-rate values that are likely data errors or
+non-representative edge cases. Values outside plausible bounds are set
+to `NA`.
+
+```{r cap-outliers}
+# IQR-based outlier removal function
+remove_outliers_iqr <- function(x, k = 3) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - k * iqr
+  upper <- q3 + k * iqr
+  ifelse(x < lower | x > upper, NA, x)
+}
+
+outlier_cols <- c(
+  # Financial ratios
+  "roa", "roe", "capital_ratio", "npl_ratio", "nim", "cost_of_funding",
+  
+  # Growth rates
+  "asset_growth", "loan_growth", "deposit_growth", "liab_growth", "equity_growth",
+  
+  # Ratio changes
+  "capital_ratio_chg", "roa_chg", "roe_chg", "nim_chg", "cost_of_funding_chg", "npl_chg",
+  
+  # Rolling 3-year std devs
+  "equity_sd_3y", "assets_sd_3y", "loans_sd_3y", "deposits_sd_3y",
+  "netinc_sd_3y", "roa_sd_3y",
+  
+  # Intra-year dynamics
+  "assets_sd_intra", "loans_sd_intra", "deposits_sd_intra", "equity_sd_intra",
+  "assets_max_decline", "loans_max_decline", "deposits_max_decline", "equity_max_decline",
+  
+  #Size
+  "num_employees"
+)
+
+df_clean <- df_clean %>%
+  mutate(across(all_of(outlier_cols), ~remove_outliers_iqr(., k = 3)))
+
+
+```
+
+# Part D: Final Model Dataset Assembly
+
+## 19. Select Model Features
+
+Assemble the final feature matrix by selecting only the variables needed
+for modelling. Features are grouped into logical categories:
+
+- **Identifiers** — kept for data splitting and reference, dropped before training
+- **Targets** — `crisis` (binary composite), `growth` (income growth flag)
+- **Balance-sheet levels** — size, capital, asset quality proxies
+- **Income statement** — non-interest income/expense, staffing, age
+- **Financial ratios** — capital adequacy, profitability, asset quality, NIM, funding cost
+- **Growth rates** — YoY changes in major balance-sheet items
+- **Ratio changes** — YoY percentage-point shifts in key ratios
+- **Rolling stats** — 3-year standard deviations capturing medium-term volatility
+- **Composition** — loan-type and deposit-type proportions
+- **Intra-year dynamics** — within-year (quarterly) volatility and max declines
+- **Macroeconomic** — GDP growth, inflation, unemployment, interest rates
+
+```{r create-model-dataset}
+df_model <- df_clean %>%
+  select(
+    #  Identifiers (keep for splitting / reference, drop before training) 
+    id_rssd, year,
+
+    #  Target 
+    crisis, growth,
+
+    #  Balance sheet levels 
+    assets, equity, ln_tot_gross, deposits, liab_tot,
+    cash, securities, llres, fixed_ass, oreo, othbor_liab, subdebt,
+
+    #  Income statement & size 
+    ytdnonint_inc, ytdnonint_exp, ytdllprov, ytdnetinc, ytdint_inc, ytdint_exp,
+    num_employees, age,
+
+    #  Financial ratios 
+    capital_ratio, roa, roe, nim, cost_of_funding, npl_ratio,
+
+    #  Growth rates 
+    asset_growth, deposit_growth, loan_growth, liab_growth, equity_growth,
+
+    #  Ratio changes (pp) 
+    capital_ratio_chg, roa_chg, roe_chg, nim_chg, cost_of_funding_chg, npl_chg,
+
+    #  Rolling 3-year stats 
+    equity_sd_3y, assets_sd_3y,
+    loans_sd_3y, deposits_sd_3y,
+    netinc_sd_3y, roa_sd_3y,
+
+    #  Loan composition 
+    prop_ln_re, prop_ln_ci, prop_ln_cons, prop_ln_agr, prop_ln_cc, prop_ln_fi, 
+
+    #  Deposit composition 
+    prop_demand_dep,
+
+    #  Intra-year dynamics (quarterly seasonality features) 
+    assets_sd_intra, loans_sd_intra, deposits_sd_intra, equity_sd_intra,
+    assets_max_decline, loans_max_decline, deposits_max_decline, equity_max_decline,
+
+    #  Macroeconomic 
+    gdp, inflation, unemployment, real_int_rate,
+    pop_total, fed_funds_rate,
+  ) %>%
+  # Drop rows with no target or outside the study period
+  filter(!is.na(crisis) & year >= 1980 & year <= 2023 & !is.na(growth))
+
+cat("Model dataset dimensions:", nrow(df_model), "rows x", ncol(df_model), "columns\n")
+cat("Crisis rate:", round(mean(df_model$crisis, na.rm = TRUE) * 100, 2), "%\n")
+cat("Growth rate:", round(mean(df_model$growth, na.rm = TRUE) * 100, 2), "%\n")
+```
+
+
+
+## 20. Export Model-Ready Dataset
+
+```{r save-model-data}
+write.csv(df_model, "../data/processed_data/df_model.csv", row.names = FALSE)
+cat("Saved df_model.csv\n")
+```

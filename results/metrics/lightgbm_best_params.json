@@ -1,0 +1,28 @@
+{
+  "crisis": {
+    "params": {
+      "num_leaves": 175,
+      "learning_rate": 0.024707323884465258,
+      "min_child_samples": 64,
+      "subsample": 0.961448391066416,
+      "colsample_bytree": 0.68190343499575,
+      "reg_lambda": 0.0029639598252320905,
+      "scale_pos_weight": 37.89867383933982
+    },
+    "best_iter": 529,
+    "cv_pr_auc": 0.5318708019933829
+  },
+  "growth": {
+    "params": {
+      "num_leaves": 90,
+      "learning_rate": 0.044705694858517595,
+      "min_child_samples": 158,
+      "subsample": 0.7989405857732342,
+      "colsample_bytree": 0.7762749009885761,
+      "reg_lambda": 0.22266039235167517,
+      "scale_pos_weight": 16.882957492061028
+    },
+    "best_iter": 212,
+    "cv_pr_auc": 0.1831492785187056
+  }
+}

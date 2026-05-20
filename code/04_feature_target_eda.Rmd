@@ -1,0 +1,1163 @@
+---
+title: "Feature–Target Exploratory Analysis"
+output: pdf_document
+date: "2026-04-24"
+---
+
+<!--
+================================================================================
+04_feature_target_eda.Rmd
+
+PURPOSE:
+  Investigate the relationship between every feature in `df_model` and the
+  binary target `crisis`. This notebook is the justification layer for the
+  feature set used in downstream modelling: for every feature we show (a)
+  its univariate distribution and (b) how that distribution differs between
+  crisis and non-crisis bank-years. The goal is to demonstrate empirically
+  that the chosen features carry signal about future distress.
+
+WORKFLOW POSITION:
+  1. 01_data_exploration.Rmd
+  2. 02_data_cleaning.Rmd
+  3. 03_data_preparation.Rmd
+  4. **04_feature_target_eda.Rmd** ← (this file)
+  5. Model training scripts (XGBoost, LightGBM, Random Forest, etc.)
+
+INPUTS:
+  - ../data/processed_data/df_model.csv  — model-ready dataset
+
+OUTPUTS:
+  - Inline figures and tables only (no artefacts written to disk)
+
+SECTIONS:
+  A. Statistical discrimination — Wilcoxon tests and standardised
+     mean differences (Cohen's d) to rank features by signal strength
+  B. Bivariate analysis — feature distribution split by crisis status
+  C. Group-wise summary statistics (mean / median / SD by crisis)
+  D. Stratified subgroup analysis — crisis rates and Cohen's d of top
+     features within bins of age, employee count, and asset size
+  E. Pre-crisis feature trajectories — median drift of key features in
+     the five years preceding crisis events, benchmarked to the
+     non-crisis baseline
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo     = TRUE,
+  message  = FALSE,
+  warning  = FALSE,
+  dev      = "png",
+  fig.width  = 9,
+  fig.height = 6,
+  dpi = 300,
+  fig.path = "../results/figures/04_eda-"
+)
+```
+
+## 1. Load Libraries
+
+```{r load-libraries}
+library(tidyverse)
+library(scales)
+library(knitr)
+library(effsize)
+library(car)
+library(gridExtra)
+```
+
+## 2. Load Model-Ready Data
+
+```{r load-data}
+df_model <- read_csv("../data/processed_data/df_model.csv",
+                     show_col_types = FALSE)
+
+cat("df_model dimensions:", nrow(df_model), "rows x", ncol(df_model), "columns\n")
+cat("Crisis rate:", round(mean(df_model$crisis, na.rm = TRUE) * 100, 2), "%\n")
+
+df_model <- df_model %>%
+  mutate(crisis_lbl = factor(crisis,
+                             levels = c(0, 1),
+                             labels = c("Non-crisis", "Crisis")))
+```
+
+---
+
+## 3. Design System
+
+A single theme and two-colour palette are used across every chart in this
+notebook so visuals stay comparable. Blue denotes non-crisis bank-years,
+red denotes crisis bank-years — the same convention used throughout the
+project.
+
+```{r design-system}
+# --- Palette ---------------------------------------------------------------
+crisis_colors <- c("Non-crisis" = "#3266ad",   # project blue
+                   "Crisis"     = "#e63946")   # project red
+
+# --- Theme -----------------------------------------------------------------
+eda_theme <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title        = element_text(face = "bold", size = base_size + 1),
+      plot.subtitle     = element_text(colour = "grey35", size = base_size - 1),
+      plot.caption      = element_text(colour = "grey45", size = base_size - 2),
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(colour = "grey92"),
+      axis.line         = element_line(colour = "grey70"),
+      strip.text        = element_text(face = "bold", size = base_size - 1),
+      legend.position   = "top",
+      legend.title      = element_blank(),
+      legend.key.height = unit(0.4, "cm")
+    )
+}
+
+
+```
+
+---
+
+## 4. Feature Groups
+
+Features are organised into the same thematic blocks used in
+`03_data_preparation.Rmd`. Grouping keeps the univariate and bivariate
+panels readable and lets us interpret each block (e.g., capital adequacy,
+asset quality) as a whole.
+
+```{r feature-groups}
+feature_groups <- list(
+  "Balance sheet (log)" = c("assets", "equity", "ln_tot_gross", "deposits",
+                            "liab_tot", "cash", "securities", "llres",
+                            "fixed_ass", "oreo", "othbor_liab", "subdebt"),
+  "Income & staffing"   = c("ytdnonint_inc", "ytdnonint_exp",
+                            "num_employees", "age"),
+  "Financial ratios"    = c("capital_ratio", "roa", "roe", "nim",
+                            "cost_of_funding", "npl_ratio"),
+  "Growth rates"        = c("asset_growth", "deposit_growth", "loan_growth",
+                            "liab_growth", "equity_growth"),
+  "Ratio changes"       = c("capital_ratio_chg", "roa_chg", "roe_chg",
+                            "nim_chg", "cost_of_funding_chg", "npl_chg"),
+  "Rolling 3y std dev"  = c("equity_sd_3y", "assets_sd_3y",
+                            "loans_sd_3y", "deposits_sd_3y",
+                            "netinc_sd_3y", "roa_sd_3y"),
+  "Composition"         = c("prop_ln_re", "prop_ln_ci", "prop_ln_cons",
+                            "prop_ln_agr", "prop_ln_cc", "prop_ln_fi", "prop_demand_dep"),
+  "Intra-year dynamics" = c("assets_sd_intra", "loans_sd_intra",
+                            "deposits_sd_intra", "equity_sd_intra",
+                            "assets_max_decline", "loans_max_decline",
+                            "deposits_max_decline", "equity_max_decline"),
+  "Macroeconomic"       = c("gdp", "inflation", "unemployment",
+                            "real_int_rate", "pop_total", "fed_funds_rate")
+)
+
+# Flatten to a (feature, group) lookup
+feat_lookup <- feature_groups %>%
+  enframe(name = "group", value = "feature") %>%
+  unnest(feature)
+
+feature_names <- c(
+  "assets" = "Assets",
+  "equity" = "Equity",
+  "deposits" = "Deposits",
+  "ln_tot_gross" = "Loans",
+  "liab_tot" = "Liabilities",
+  "ytdnetinc" = "Net Income",
+  "cash" = "Cash",
+  "securities" = "Securities",
+  "llres" = "Loan Loss Reserves",
+  "fixed_ass" = "Fixed Assets",
+  "oreo" = "Other Real Estate Owned",
+  "othbor_liab" = "Other Borrowed Liabilities",
+  "subdebt" = "Subordinated Debt",
+  "ytdnonint_inc" = "Non-interest Income",
+  "ytdnonint_exp" = "Non-interest Expense",
+  "num_employees" = "Number of Employees",
+  "age" = "Bank Age",
+  "capital_ratio" = "Capital Ratio",
+  "roa" = "ROA",
+  "roe" = "ROE",
+  "nim" = "NIM",
+  "cost_of_funding" = "Cost of Funding",
+  "npl_ratio" = "NPL Ratio",
+  "asset_growth" = "Asset Growth",
+  "deposit_growth" = "Deposit Growth",
+  "loan_growth" = "Loan Growth",
+  "liab_growth" = "Liability Growth",
+  "equity_growth" = "Equity Growth",
+  "capital_ratio_chg" = "Capital Ratio Change",
+  "roa_chg" = "ROA Change",
+  "roe_chg" = "ROE Change",
+  "nim_chg" = "NIM Change",
+  "cost_of_funding_chg" = "Cost of Funding Change",
+  "npl_chg" = "NPL Change",
+  "equity_sd_3y" = "Equity Volatility (3Y)",
+  "assets_sd_3y" = "Assets Volatility (3Y)",
+  "loans_sd_3y" = "Loans Volatility (3Y)",
+  "deposits_sd_3y" = "Deposits Volatility (3Y)",
+  "netinc_sd_3y" = "Net Income Volatility (3Y)",
+  "roa_sd_3y" = "ROA Volatility (3Y)",
+  "prop_ln_re" = "Prop. Real Estate Loans",
+  "prop_ln_ci" = "Prop. C&I Loans",
+  "prop_ln_cons" = "Prop. Consumer Loans",
+  "prop_ln_agr" = "Prop. Agricultural Loans",
+  "prop_ln_cc" = "Prop. Credit Cards",
+  "prop_ln_fi" = "Prop. Financial Institutions",
+  "prop_demand_dep" = "Prop. Demand Deposits",
+  "assets_sd_intra" = "Assets Volatility (Intra)",
+  "loans_sd_intra" = "Loans Volatility (Intra)",
+  "deposits_sd_intra" = "Deposits Volatility (Intra)",
+  "equity_sd_intra" = "Equity Volatility (Intra)",
+  "assets_max_decline" = "Assets Max Decline",
+  "loans_max_decline" = "Loans Max Decline",
+  "deposits_max_decline" = "Deposits Max Decline",
+  "equity_max_decline" = "Equity Max Decline",
+  "gdp" = "GDP",
+  "inflation" = "Inflation",
+  "unemployment" = "Unemployment Rate",
+  "real_int_rate" = "Real Interest Rate",
+  "pop_total" = "Population Total",
+  "fed_funds_rate" = "Fed Funds Rate"
+)
+
+```
+
+Features that are strictly positive and heavily right-skewed
+(balance-sheet levels) are log-transformed for visualisation only. All
+statistical tests use the raw values.
+
+```{r log-set}
+log_features <- feature_groups[["Balance sheet (log)"]]
+```
+
+
+# Part A — Statistical Discrimination
+
+Distributional differences are quantified with two complementary measures:
+
+1. **Wilcoxon rank-sum test** — non-parametric, no normality assumption.
+   Reports whether the two conditional distributions differ at all.
+2. **Cohen's d** — standardised mean difference. Interpretable effect
+   size; |d| > 0.2 = small, > 0.5 = medium, > 0.8 = large.
+
+A feature is a strong candidate predictor when the Wilcoxon p-value is
+small **and** |d| is not negligible.
+
+
+## 5. Feature Ranking by Effect Size
+
+```{r discrim-stats}
+compute_discrim <- function(feat) {
+  x <- df_model[[feat]][df_model$crisis == 0]
+  y <- df_model[[feat]][df_model$crisis == 1]
+
+  # Drop NA *and* Inf / -Inf (growth rates can blow up when lag() is ~0)
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+
+  sdx <- if (length(x) > 1) sd(x) else NA_real_
+  sdy <- if (length(y) > 1) sd(y) else NA_real_
+
+  bad <- length(x) < 30 || length(y) < 30 ||
+         is.na(sdx) || is.na(sdy) ||
+         sdx == 0 || sdy == 0
+
+  if (bad) {
+    return(tibble(feature = feat,
+                  p_wilcox = NA_real_,
+                  cohen_d  = NA_real_))
+  }
+
+  w <- suppressWarnings(wilcox.test(x, y, exact = FALSE))
+  d <- tryCatch(effsize::cohen.d(y, x, na.rm = TRUE)$estimate,
+                error = function(e) NA_real_)
+
+  tibble(feature = feat,
+         p_wilcox = w$p.value,
+         cohen_d  = d)
+}
+
+discrim <- map_dfr(feat_lookup$feature, compute_discrim) %>%
+  left_join(feat_lookup, by = "feature") %>%
+  mutate(abs_d = abs(cohen_d)) %>%
+  arrange(desc(abs_d))
+```
+
+```{r discrim-plot, fig.height=10}
+discrim %>%
+  filter(!is.na(cohen_d)) %>%
+  mutate(feature_label = feature_names[feature]) %>%
+  mutate(feature_label = fct_reorder(feature_label, abs_d),
+         sign    = ifelse(cohen_d >= 0, "Higher in crisis", "Lower in crisis")) %>%
+  ggplot(aes(x = cohen_d, y = feature_label, fill = sign)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, colour = "grey40", linewidth = 0.3) +
+  geom_vline(xintercept = c(-0.2, 0.2),
+             linetype = "dashed", colour = "grey60", linewidth = 0.3) +
+  scale_fill_manual(values = c("Higher in crisis" = crisis_colors["Crisis"],
+                               "Lower in crisis"  = crisis_colors["Non-crisis"])) +
+  labs(title = "Feature discrimination ranked by Cohen's d",
+       subtitle = "Dashed lines = small-effect threshold (|d| = 0.2)",
+       x = "Cohen's d (crisis - non-crisis, standardised)",
+       y = NULL) +
+  eda_theme()
+ggsave("../results/figures/04_feature_discrimination_ranking.png", width = 10, height = 12)
+```
+
+## 6. Full Discrimination Table
+
+```{r discrim-table}
+discrim %>%
+  transmute(
+    Group   = group,
+    Feature = feature_names[feature],
+    `Cohen's d` = round(cohen_d, 3),
+    `|d|`       = round(abs_d, 3),
+    `Wilcoxon p` = signif(p_wilcox, 3),
+    Direction = case_when(
+      is.na(cohen_d)      ~ "—",
+      cohen_d >=  0.2     ~ "Crisis ↑ (meaningful)",
+      cohen_d <= -0.2     ~ "Crisis ↓ (meaningful)",
+      TRUE                ~ "Small / negligible"
+    )
+  ) %>%
+  kable(caption = "Wilcoxon rank-sum test and Cohen's d for every feature. Sorted by |d|.")
+```
+
+## 7. Share of Features with a Meaningful Effect
+
+```{r discrim-summary}
+discrim %>%
+  filter(!is.na(cohen_d)) %>%
+  mutate(bucket = case_when(
+    abs_d <  0.2 ~ "Negligible (|d| < 0.2)",
+    abs_d <  0.5 ~ "Small (0.2–0.5)",
+    abs_d <  0.8 ~ "Medium (0.5–0.8)",
+    TRUE         ~ "Large (> 0.8)"
+  ),
+  bucket = factor(bucket,
+                  levels = c("Negligible (|d| < 0.2)",
+                             "Small (0.2–0.5)",
+                             "Medium (0.5–0.8)",
+                             "Large (> 0.8)"))) %>%
+  count(bucket) %>%
+  mutate(share = n / sum(n)) %>%
+  ggplot(aes(x = bucket, y = n, fill = bucket)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0(n, "\n(", percent(share, 0.1), ")")),
+            vjust = -0.2, size = 3.4, lineheight = 0.95) +
+  scale_fill_manual(values = c("#c9d5e6", "#7fa0c7",
+                               crisis_colors["Non-crisis"],
+                               crisis_colors["Crisis"])) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  coord_cartesian(clip = "off") +
+  labs(title = "How many features carry a meaningful crisis signal?",
+       subtitle = "Buckets based on |Cohen's d|",
+       x = NULL, y = "Number of features") +
+  eda_theme() +
+  theme(legend.position = "none")
+```
+
+
+
+# Part B — Bivariate Analysis: Feature vs Crisis
+
+For every feature we now overlay the conditional distribution under
+`crisis = 0` (blue) and `crisis = 1` (red). Visual separation between the
+two distributions is direct evidence that the feature discriminates.
+
+## 8. Density Plots by Crisis Status
+
+```{r density-fn}
+plot_density <- function(feats, title, log_x = FALSE) {
+  sig_feats <- discrim %>% filter(feature %in% feats, abs_d >= 0.2) %>% pull(feature)
+  
+  d <- df_model %>%
+    select(crisis_lbl, all_of(feats)) %>%
+    pivot_longer(-crisis_lbl, names_to = "feature", values_to = "value") %>%
+    filter(!is.na(value) & is.finite(value)) %>%
+    mutate(feature_label = factor(feature_names[feature], levels = feature_names[feats]))
+    
+  sig_df <- tibble(
+    feature_label = factor(feature_names[sig_feats], levels = feature_names[feats])
+  )
+  
+  if (log_x) {
+    d <- d %>% 
+      filter(value > 0) %>%
+      mutate(value = log10(value))
+    xlab <- "log10(value)"
+  } else {
+    xlab <- "Value"
+  }
+  
+  p <- ggplot(d, aes(x = value, fill = crisis_lbl, colour = crisis_lbl)) +
+    geom_blank()
+  
+  if (nrow(sig_df) > 0) {
+    p <- p + geom_rect(data = sig_df, aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf), 
+                       fill = "ivory", inherit.aes = FALSE)
+  }
+  
+p <- p +
+  geom_density(alpha = 0.35, linewidth = 0.4) +
+  facet_wrap(~ feature_label, scales = "free", ncol = 3) +
+  scale_fill_manual(values = crisis_colors) +
+  scale_colour_manual(values = crisis_colors) +
+  labs(title = title,
+       subtitle = "Ivory background indicates |Cohen's d| >= 0.2",
+       x = xlab, y = "Density") +
+  eda_theme() +
+  theme(
+    panel.background = element_rect(fill = "transparent", colour = NA),
+
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 11),
+    strip.text = element_text(size = 12),     
+    legend.text = element_text(size = 11),
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),  # centered
+    plot.subtitle = element_text(size = 12, hjust = 0.5, face = "italic")
+  )
+    
+  return(p)
+}
+```
+
+### 8.1 Balance-sheet levels
+
+```{r den-balance, fig.height=8}
+plot_density(log_features,
+             "Balance Sheet Variables: Density by Crisis Status",
+             log_x = TRUE)
+```
+
+### 8.2 Financial ratios
+
+```{r den-ratios, fig.height=5}
+plot_density(feature_groups[["Financial ratios"]],
+             "Financial Ratios: Density by Crisis Status")
+```
+
+### 8.3 Growth Rates & Ratio Changes
+
+```{r den-growth-ratio, fig.height=10}
+plot_density(c(feature_groups[["Growth rates"]], feature_groups[["Ratio changes"]]),
+             "YOY Growth Rates & Ratio Changes: Density by Crisis Status")
+```
+
+### 8.4 Rolling 3-year std dev
+
+```{r den-rolling, fig.height=5}
+plot_density(feature_groups[["Rolling 3y std dev"]],
+             "Rolling volatility — density by crisis status")
+```
+
+### 8.5 Composition
+
+```{r den-comp, fig.height=5}
+plot_density(feature_groups[["Composition"]],
+             "Composition — density by crisis status")
+```
+
+### 8.6 Loan Portfolio Composition — Crisis vs Non-Crisis
+
+```{r pie-loan-composition, fig.height=5, fig.width=10}
+# --- Loan-type proportion columns ---
+loan_props <- c("prop_ln_re", "prop_ln_ci", "prop_ln_cons",
+                "prop_ln_agr", "prop_ln_cc", "prop_ln_fi")
+
+loan_labels <- c("Real Estate", "C&I", "Consumer",
+                 "Agricultural", "Credit Cards", "Fin. Institutions")
+
+# Average proportions per group
+loan_avg <- df_model %>%
+  group_by(crisis_lbl) %>%
+  summarise(across(all_of(loan_props), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  pivot_longer(-crisis_lbl, names_to = "loan_type", values_to = "proportion")
+
+# Add "Other Loans" = 1 - sum of named types
+other_loans <- loan_avg %>%
+  group_by(crisis_lbl) %>%
+  summarise(proportion = 1 - sum(proportion), .groups = "drop") %>%
+  mutate(loan_type = "other")
+
+loan_pie <- bind_rows(loan_avg, other_loans) %>%
+  mutate(label = dplyr::recode(loan_type,
+                        prop_ln_re   = "Real Estate",
+                        prop_ln_ci   = "C&I",
+                        prop_ln_cons = "Consumer",
+                        prop_ln_agr  = "Agricultural",
+                        prop_ln_cc   = "Credit Cards",
+                        prop_ln_fi   = "Fin. Institutions",
+                        other        = "Other Loans"))
+
+# Colours — RColorBrewer Set1
+loan_fill <- setNames(RColorBrewer::brewer.pal(7, "Set1"),
+                      c("Real Estate", "C&I", "Consumer",
+                        "Agricultural", "Credit Cards",
+                        "Fin. Institutions", "Other Loans"))
+
+# Build pie via coord_polar on a bar chart
+ggplot(loan_pie,
+       aes(x = "", y = proportion, fill = label)) +
+  geom_col(width = 1, colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(proportion >= 0.1,
+                                paste0(round(proportion * 100, 1), "%"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 4, colour = "grey15") +
+  coord_polar(theta = "y") +
+  facet_wrap(~ crisis_lbl) +
+  scale_fill_manual(values = loan_fill) +
+  labs(title = "Loan Portfolio Composition by Crisis Status",
+       fill = NULL) +
+  eda_theme() +
+  theme(axis.title = element_blank(),
+        axis.text  = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12),      # facet title
+        legend.text = element_text(size = 11),
+        axis.line = element_blank(),
+        plot.title = element_text(size = 15, face = "bold", hjust = 0.5))
+```
+
+### 8.7 Deposit Composition — Crisis vs Non-Crisis
+
+```{r pie-deposit-composition, fig.height=5, fig.width=10}
+# Demand deposits proportion is prop_demand_dep; time = 1 - demand
+dep_avg <- df_model %>%
+  group_by(crisis_lbl) %>%
+  summarise(Demand = mean(prop_demand_dep, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(Time = 1 - Demand) %>%
+  pivot_longer(-crisis_lbl, names_to = "deposit_type", values_to = "proportion")
+
+dep_fill <- setNames(RColorBrewer::brewer.pal(3, "Set1")[1:2],
+                     c("Demand", "Time"))
+
+ggplot(dep_avg,
+       aes(x = "", y = proportion, fill = deposit_type)) +
+  geom_col(width = 1, colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = paste0(round(proportion * 100, 1), "%")),
+            position = position_stack(vjust = 0.5),
+            size = 4, colour = "grey15") +
+  coord_polar(theta = "y") +
+  facet_wrap(~ crisis_lbl) +
+  scale_fill_manual(values = dep_fill) +
+  labs(title = "Deposit Composition",
+       subtitle = "Average share of demand vs time deposits — Crisis vs Non-crisis banks",
+       fill = NULL) +
+  eda_theme() +
+  theme(axis.title = element_blank(),
+        axis.text  = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank())
+```
+
+### 8.8 Intra-year dynamics
+
+```{r den-intra, fig.height=7}
+plot_density(feature_groups[["Intra-year dynamics"]],
+             "Intra-year dynamics — density by crisis status")
+```
+
+### 8.9 Macroeconomic
+
+```{r den-macro, fig.height=5}
+plot_density(feature_groups[["Macroeconomic"]],
+             "Macro environment — density by crisis status")
+```
+
+## 9. Boxplots by Crisis Status
+
+Boxplots provide a complementary view: medians, IQRs, and tails per class.
+
+```{r box-fn}
+plot_box <- function(feats, title, log_y = FALSE) {
+  sig_feats <- discrim %>% filter(feature %in% feats, abs_d >= 0.2) %>% pull(feature)
+  
+  d <- df_model %>%
+    select(crisis_lbl, all_of(feats)) %>%
+    pivot_longer(-crisis_lbl, names_to = "feature", values_to = "value") %>%
+    filter(!is.na(value)) %>%
+    mutate(feature_label = factor(feature_names[feature], levels = feature_names[feats]))
+    
+  sig_df <- tibble(
+    feature_label = factor(feature_names[sig_feats], levels = feature_names[feats])
+  )
+
+  if (log_y) {
+    d <- d %>% mutate(value = ifelse(value > 0, log10(value), NA_real_)) %>%
+      filter(!is.na(value))
+    ylab <- "log10(value)"
+  } else {
+    ylab <- "Value"
+  }
+
+  p <- ggplot(d, aes(x = crisis_lbl, y = value, fill = crisis_lbl)) +
+    geom_blank()
+    
+  if (nrow(sig_df) > 0) {
+    p <- p + geom_rect(data = sig_df, aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf), 
+                       fill = "ivory", inherit.aes = FALSE)
+  }
+  
+  p <- p +
+    geom_boxplot(alpha = 0.75,
+                 outlier.size = 0.4,
+                 outlier.alpha = 0.3,
+                 linewidth = 0.3) +
+    facet_wrap(~ feature_label, scales = "free", ncol = 3) +
+    scale_fill_manual(values = crisis_colors) +
+    labs(title = title,
+         subtitle = "Ivory background indicates |Cohen's d| >= 0.2",
+         x = NULL, y = ylab) +
+    eda_theme() +
+    theme(legend.position = "none",
+          panel.background = element_rect(fill = "transparent", colour = NA),
+          axis.title = element_blank(),
+          axis.text = element_text(size = 11),
+          strip.text = element_text(size = 12),      # facet title
+          legend.text = element_text(size = 11),
+          plot.title = element_text(size = 15, face = "bold", hjust = 0.5),  # centered
+          plot.subtitle = element_text(size = 12, hjust = 0.5, face = "italic"))
+          
+  return(p)
+}
+```
+
+### 9.1 Financial ratios
+
+```{r box-ratios, fig.height=5}
+plot_box(feature_groups[["Financial ratios"]],
+         "Financial ratios — boxplots by crisis status")
+```
+
+### 9.2 Growth rates
+
+```{r box-growth, fig.height=5}
+plot_box(feature_groups[["Growth rates"]],
+         "Growth rates by Crisis Status")
+```
+
+### 9.3 Ratio changes
+
+```{r box-ratio-chg, fig.height=5}
+plot_box(feature_groups[["Ratio changes"]],
+         "Ratio changes by Crisis Status")
+```
+
+### 9.4 Rolling volatility
+
+```{r box-rolling, fig.height=5}
+plot_box(feature_groups[["Rolling 3y std dev"]],
+         "Rolling volatility by Crisis Status")
+```
+
+### 9.5 Intra-year dynamics
+
+```{r box-intra, fig.height=7}
+plot_box(feature_groups[["Intra-year dynamics"]],
+         "Intra-year dynamics by Crisis Status")
+```
+
+---
+
+## 10. Group-wise Summary Statistics (Part C)
+
+For every feature we report the mean and median under each class, plus
+their ratio (crisis / non-crisis). A ratio far from 1 signals a strong
+conditional shift.
+
+```{r summary-stats}
+summary_by_crisis <- df_model %>%
+  select(crisis_lbl, all_of(feat_lookup$feature)) %>%
+  pivot_longer(-crisis_lbl, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  group_by(feature, crisis_lbl) %>%
+  summarise(
+    mean   = mean(value),
+    median = median(value),
+    sd     = sd(value),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from  = crisis_lbl,
+    values_from = c(mean, median, sd),
+    names_sep   = "_"
+  ) %>%
+  left_join(feat_lookup, by = "feature") %>%
+  mutate(
+    mean_diff   = `mean_Crisis`   - `mean_Non-crisis`,
+    median_diff = `median_Crisis` - `median_Non-crisis`
+  ) %>%
+  select(group, feature,
+         mean_nc   = `mean_Non-crisis`,   mean_cr   = `mean_Crisis`,
+         median_nc = `median_Non-crisis`, median_cr = `median_Crisis`,
+         mean_diff, median_diff) %>%
+  mutate(feature = feature_names[feature]) %>%
+  arrange(group, feature)
+```
+
+
+## 11. Stratified Subgroup Analysis (Part D)
+
+The discrimination results in Part A are pooled across the whole panel.
+A feature that only separates crisis from non-crisis for small banks, or
+only for very young banks, is useful — but tells a different story than
+one that discriminates everywhere. This section bins the panel by age,
+employee count, and asset size, then repeats the bivariate comparison
+within each bin.
+
+## 12. Define Subgroup Bins
+
+```{r subgroup-bins}
+# Asset size quartiles (log-based labels so they stay readable)
+asset_breaks <- quantile(df_model$assets,
+                         probs = c(0, 0.25, 0.5, 0.75, 1),
+                         na.rm = TRUE)
+
+df_strata <- df_model %>%
+  mutate(
+    age_bin = cut(age,
+                  breaks = c(-Inf, 10, 25, 50, Inf),
+                  labels = c("3–10y", "10–25y", "25–50y", "50y+"),
+                  right = FALSE),
+    emp_bin = cut(num_employees,
+                  breaks = c(-Inf, 20, 100, 200, Inf),
+                  labels = c("<20", "20–100", "100–200", "200+"),
+                  right = FALSE),
+    size_bin = cut(assets,
+                   breaks = unique(asset_breaks),
+                   labels = c("Q1 (smallest)", "Q2", "Q3", "Q4 (largest)"),
+                   include.lowest = TRUE)
+  )
+```
+
+## 13. Crisis Rate by Subgroup
+
+A structural view: which kinds of banks are at elevated risk before we
+bring features into the picture.
+
+```{r subgroup-rate-fn}
+plot_crisis_rate_by_bin <- function(bin_col, title) {
+  d <- df_strata %>%
+    filter(!is.na(.data[[bin_col]])) %>%
+    group_by(bin = .data[[bin_col]]) %>%
+    summarise(
+      n_total = n(),
+      n_banks = n_distinct(id_rssd, na.rm = TRUE),
+      n_crisis = sum(crisis_lbl == "Crisis", na.rm = TRUE),
+      rate = n_crisis / n_total,
+      .groups = "drop"
+    )
+
+  ggplot(d, aes(x = bin, y = rate)) +
+    geom_col(fill = crisis_colors["Crisis"], width = 0.6) +
+    geom_text(aes(label = paste0(percent(rate, 0.01), "\n(n = ", comma(n_banks), ")")),
+              vjust = -0.2, size = 3.5, lineheight = 0.9, colour = "black") +
+    scale_y_continuous(labels = percent_format(accuracy = 0.1),
+                       expand = expansion(mult = c(0, 0.15))) +
+    labs(title = title,
+         x = NULL, y = "Crisis rate") +
+    eda_theme() +
+    theme(plot.title = element_text(size = 15, face = "bold"), 
+          axis.title = element_text(size = 12),
+          axis.text = element_text(size = 10))
+}
+```
+
+### 13.1 Crisis rate by bank age
+
+```{r rate-age, fig.height=4}
+subgr1 <- plot_crisis_rate_by_bin("age_bin", "Crisis rate by bank age")
+```
+
+### 13.2 Crisis rate by employee count
+
+```{r rate-emp, fig.height=4}
+subgr2 <- plot_crisis_rate_by_bin("emp_bin", "Crisis rate by number of employees")
+```
+
+
+```{r subgroups}
+grid.arrange(subgr1, subgr2, ncol = 1)
+ggsave("../results/figures/04_crisis_rate_subgroups.png", 
+       plot = grid.arrange(subgr1, subgr2, ncol = 1),
+       width = 8, height = 8)
+```
+
+### 13.3 Distribution of Bank Age and Size by Crisis Status
+
+```{r density-age-size, fig.height=7}
+p_age <- ggplot(df_model, aes(x = age, fill = crisis_lbl, colour = crisis_lbl)) +
+  geom_density(alpha = 0.35, linewidth = 0.4) +
+  scale_fill_manual(values = crisis_colors) +
+  scale_colour_manual(values = crisis_colors) +
+  labs(title = "Bank Age — density by crisis status",
+       x = "Bank Age (years)", y = "Density") +
+  eda_theme()
+
+p_size <- ggplot(df_model %>% filter(num_employees > 0),
+                 aes(x = num_employees, fill = crisis_lbl, colour = crisis_lbl)) +
+  geom_density(alpha = 0.35, linewidth = 0.4) +
+  scale_fill_manual(values = crisis_colors) +
+  scale_colour_manual(values = crisis_colors) +
+  labs(title = "Number of Employees — density by crisis status",
+       x = "Number of Employees", y = "Density") +
+  eda_theme()
+
+grid.arrange(p_age, p_size, ncol = 1)
+```
+
+## 14. Does Feature Signal Survive Inside Each Subgroup?
+
+We pick the top features by pooled |Cohen's d| (from Part A) and
+recompute the effect size *within* each subgroup bin. A heatmap shows
+whether each feature discriminates uniformly or only in specific
+segments.
+
+
+```{r subgroup-d-helpers}
+# Lightweight Cohen's d — avoids the effsize dependency inside loops.
+quick_d <- function(x, y) {
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  if (length(x) < 30 || length(y) < 30) return(NA_real_)
+  sdx <- sd(x); sdy <- sd(y)
+  if (is.na(sdx) || is.na(sdy) || sdx == 0 || sdy == 0) return(NA_real_)
+  pooled <- sqrt((sdx^2 + sdy^2) / 2)
+  (mean(y) - mean(x)) / pooled
+}
+
+# Top features by absolute pooled d (from the `discrim` table built in Part A).
+top_feats <- discrim %>%
+  filter(!is.na(cohen_d)) %>%
+  slice_max(order_by = abs_d, n = 10) %>%
+  pull(feature)
+
+compute_subgroup_d <- function(bin_col) {
+  df_strata %>%
+    filter(!is.na(.data[[bin_col]])) %>%
+    group_by(bin = .data[[bin_col]]) %>%
+    summarise(across(all_of(top_feats),
+                     ~ quick_d(.x[crisis == 0], .x[crisis == 1])),
+              .groups = "drop") %>%
+    pivot_longer(-bin, names_to = "feature", values_to = "d") %>%
+    mutate(feature_label = factor(feature_names[feature], levels = rev(feature_names[top_feats])))
+}
+```
+
+```{r subgroup-d-plot-fn}
+plot_subgroup_heatmap <- function(bin_col, title) {
+  d <- compute_subgroup_d(bin_col)
+
+  # Symmetric colour scale around zero so direction is readable.
+  lim <- max(abs(d$d), na.rm = TRUE)
+
+  ggplot(d, aes(x = bin, y = feature_label, fill = d)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = ifelse(is.na(d), "—", sprintf("%.2f", d))),
+              size = 3, colour = "grey15") +
+    scale_fill_gradient2(low  = crisis_colors["Non-crisis"],
+                         mid  = "grey95",
+                         high = crisis_colors["Crisis"],
+                         midpoint = 0,
+                         limits = c(-lim, lim),
+                         na.value = "grey90",
+                         name = "Cohen's d") +
+    labs(title = title,
+         subtitle = "Red = higher under crisis; blue = lower under crisis",
+         x = NULL, y = NULL) +
+    eda_theme() +
+    theme(legend.position = "right",
+          panel.grid = element_blank())
+}
+```
+
+### 14.1 Top features × age bin
+
+```{r d-by-age, fig.height=6}
+plot_subgroup_heatmap("age_bin",
+                      "Cohen's d of top features within age bins")
+```
+
+### 14.2 Top features × employee count
+
+```{r d-by-emp, fig.height=6}
+plot_subgroup_heatmap("emp_bin",
+                      "Cohen's d of top features within employee-count bins")
+```
+
+### 14.3 Top features × asset size
+
+```{r d-by-size, fig.height=6}
+plot_subgroup_heatmap("size_bin",
+                      "Cohen's d of top features within asset-size quartiles")
+```
+
+---
+
+## 15. Pre-Crisis Feature Trajectories (Part E)
+
+The strongest case for an early-warning feature set is not that features
+differ *at* a crisis event, but that they drift in a predictable
+direction for several years before it. This section tracks the median
+trajectory of key features in the five years preceding each crisis event
+and compares it to the baseline level among non-crisis bank-years.
+
+## 16. Build the Event-Time Panel
+
+```{r event-time-panel}
+# Features to track through time — keep the list small so each panel
+# is readable. Covers capital, profitability, growth, and volatility.
+traj_features <- c("asset_growth", "equity_growth", "liab_growth", "loan_growth", "deposit_growth", "roe", "roa", "ytdnetinc")
+
+# One row per (crisis event, offset in 0..5). Offset = years *before*
+# the crisis event; offset 0 is the last pre-event observation.
+crisis_events <- df_model %>%
+  filter(crisis == 1) %>%
+  select(id_rssd, event_year = year)
+
+trajectory <- crisis_events %>%
+  crossing(offset = 0:5) %>%
+  mutate(obs_year = event_year - offset) %>%
+  inner_join(
+    df_model %>% select(id_rssd, year, all_of(traj_features)),
+    by = c("id_rssd", "obs_year" = "year")
+  )
+
+cat("Crisis events:", nrow(crisis_events), "\n")
+cat("Event-time observations:", nrow(trajectory), "\n")
+```
+
+## 17. Median Trajectory with IQR Band
+
+For each offset we summarise crisis banks' feature values; the non-crisis
+baseline is the global median across all non-crisis bank-years (shown as
+a dashed line).
+
+```{r traj-summaries}
+traj_long <- trajectory %>%
+  pivot_longer(all_of(traj_features),
+               names_to = "feature", values_to = "value") %>%
+  filter(is.finite(value)) %>%
+  group_by(feature) %>%
+  ungroup()
+
+traj_summary <- traj_long %>%
+  group_by(feature, offset) %>%
+  summarise(
+    median = median(value, na.rm = TRUE),
+    q25    = quantile(value, 0.25, na.rm = TRUE),
+    q75    = quantile(value, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # x-axis goes from -5 (far before) to 0 (just before event)
+  mutate(years_before = -offset)
+
+# Non-crisis baseline per feature
+baseline <- df_model %>%
+  filter(crisis == 0) %>%
+  select(all_of(traj_features)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "value") %>%
+  filter(is.finite(value)) %>%
+  group_by(feature) %>%
+  summarise(nc_median = median(value), .groups = "drop")
+```
+
+```{r traj-plot, fig.height=8}
+traj_plot_data <- traj_summary %>%
+  left_join(baseline, by = "feature") %>%
+  mutate(feature_label = factor(feature_names[feature], levels = feature_names[traj_features]))
+
+ggplot(traj_plot_data, aes(x = years_before)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75),
+              fill = crisis_colors["Crisis"], alpha = 0.18) +
+  geom_line(aes(y = median),
+            colour = crisis_colors["Crisis"], linewidth = 0.7) +
+  geom_point(aes(y = median),
+             colour = crisis_colors["Crisis"], size = 1.6) +
+  geom_hline(aes(yintercept = nc_median),
+             colour = crisis_colors["Non-crisis"],
+             linetype = "dashed", linewidth = 0.5) +
+  facet_wrap(~ feature_label, scales = "free", ncol = 3) +
+  scale_x_continuous(breaks = -5:0,
+                     labels = c("t-5", "t-4", "t-3", "t-2", "t-1", "t")) +
+  labs(title = "Feature trajectories in the five years before a crisis event",
+       subtitle = paste0("Red line/ribbon = crisis banks (median, IQR); ",
+                         "blue dashed line = non-crisis baseline median"),
+       x = "Years relative to crisis event",
+       y = "Feature value") +
+  eda_theme()
+```
+
+## 18. Gap to Baseline at Each Offset
+
+A single number per offset makes the drift direction explicit: for each
+feature and each offset we compute (crisis median - non-crisis median),
+standardised by the non-crisis IQR so values are comparable across
+features.
+
+```{r traj-gap}
+nc_stats <- df_model %>%
+  filter(crisis == 0) %>%
+  select(all_of(traj_features)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "value") %>%
+  filter(is.finite(value)) %>%
+  group_by(feature) %>%
+  summarise(nc_median = median(value),
+            nc_iqr    = IQR(value),
+            .groups = "drop")
+
+gap_df <- traj_summary %>%
+  left_join(nc_stats, by = "feature") %>%
+  mutate(std_gap = (median - nc_median) / nc_iqr) %>%
+  filter(is.finite(std_gap)) %>%
+  mutate(feature_label = factor(feature_names[feature], levels = feature_names[traj_features]))
+
+ggplot(gap_df,
+       aes(x = years_before, y = feature_label, fill = std_gap)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", std_gap)),
+            size = 3, colour = "grey15") +
+  scale_fill_gradient2(low  = crisis_colors["Non-crisis"],
+                       mid  = "grey95",
+                       high = crisis_colors["Crisis"],
+                       midpoint = 0,
+                       name = "Std. gap") +
+  scale_x_continuous(breaks = -5:0,
+                     labels = c("t-5", "t-4", "t-3", "t-2", "t-1", "t")) +
+  labs(title = "Standardised gap to non-crisis baseline by event-time",
+       subtitle = "Gap = (crisis median - non-crisis median) / non-crisis IQR",
+       x = "Years relative to crisis event", y = NULL) +
+  eda_theme() +
+  theme(panel.grid = element_blank())
+```
+
+## 19. Final Feature Selection
+
+```{r final-selection}
+train <- df_model %>% filter(year <= 2012)
+feature_cols <- setdiff(names(df_model), c("id_rssd", "year", "crisis", "growth"))
+numeric_features <- feature_cols[sapply(df_model[feature_cols], is.numeric)]
+cat("Starting features:", length(numeric_features), "\n")
+cat(paste(numeric_features, collapse = ", "), "\n")
+```
+
+```{r feature-selection-loop}
+targets <- c("crisis", "growth")
+
+for (target_var in targets) {
+  cat("\n=================================================================\n")
+  cat("FEATURE SELECTION FOR TARGET:", target_var, "\n")
+  cat("=================================================================\n\n")
+  
+  d_results <- tibble(feature = character(), cohens_d = numeric(), decision = character())
+  
+  for (feat in numeric_features) {
+    x <- train[[feat]][train[[target_var]] == 0]
+    y <- train[[feat]][train[[target_var]] == 1]
+    x <- x[is.finite(x)]
+    y <- y[is.finite(y)]
+    
+    if (length(x) < 30 | length(y) < 30) {
+      if (feat == "num_employees") {
+        d_results <- bind_rows(d_results, tibble(feature = feat, cohens_d = NA, decision = "KEEP"))
+      } else {
+        d_results <- bind_rows(d_results, tibble(feature = feat, cohens_d = NA, decision = "DROPPED (insufficient data)"))
+      }
+      next
+    }
+    
+    d <- tryCatch(abs(cohen.d(y, x, na.rm = TRUE)$estimate), error = function(e) NA)
+    
+    d_threshold <- if (target_var == "crisis") 0.2 else 0.1
+    if (feat == "num_employees" || (!is.na(d) && d >= d_threshold)) {
+      d_results <- bind_rows(d_results, tibble(feature = feat, cohens_d = round(d, 4), decision = "KEEP"))
+    } else {
+      d_results <- bind_rows(d_results, tibble(feature = feat, cohens_d = round(d, 4), decision = "DROPPED"))
+    }
+  }
+  
+  d_results <- d_results %>% arrange(desc(cohens_d))
+  
+  cat(paste0("=== DROPPED by Cohen's d (|d| < ", d_threshold, ") ===\n"))
+  d_results %>% filter(decision != "KEEP") %>% print(n = 100)
+  
+  cat("\n=== KEPT after Cohen's d ===\n")
+  d_results %>% filter(decision == "KEEP") %>% print(n = 100)
+  
+  keep_d <- d_results %>% filter(decision == "KEEP") %>% pull(feature)
+  cat("\nKept:", length(keep_d), "/ Dropped:", sum(d_results$decision != "KEEP"), "\n")
+  
+  # VIF filter
+  X_train <- train[keep_d]
+  X_train <- X_train %>% mutate(across(everything(), ~replace(., !is.finite(.), NA)))
+  
+  # Median-impute instead of dropping rows (preserves all observations)
+  X_train <- X_train %>%
+    mutate(across(everything(), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+  
+  keep_vif <- keep_d
+  vif_drops <- tibble(step = integer(), feature = character(), vif_value = numeric())
+  step <- 0
+  
+  repeat {
+    if (length(keep_vif) < 2) break
+    
+    df_vif <- X_train[keep_vif]
+    df_vif$dummy_y <- rnorm(nrow(df_vif))
+    
+    fit <- lm(dummy_y ~ ., data = df_vif)
+    vifs <- tryCatch(vif(fit), error = function(e) NULL)
+    
+    if (is.null(vifs)) {
+      cat("VIF computation failed — likely rank deficiency. Stopping.\n")
+      break
+    }
+    
+    vifs_to_check <- vifs[names(vifs) != "num_employees"]
+    if (length(vifs_to_check) == 0 || max(vifs_to_check) < 10) break
+    
+    step <- step + 1
+    worst <- names(which.max(vifs_to_check))
+    vif_drops <- bind_rows(vif_drops, tibble(
+      step = step, feature = worst, vif_value = round(max(vifs_to_check), 1)
+    ))
+    cat("Step", step, ": drop", worst, "(VIF =", round(max(vifs_to_check), 1), ")\n")
+    keep_vif <- setdiff(keep_vif, worst)
+  }
+  
+  cat("\n=== SURVIVING features for", target_var, "===\n")
+  cat(paste(keep_vif, collapse = ", "), "\n")
+  cat("Final count:", length(keep_vif), "\n")
+  
+  # Summary table
+  summary_table <- d_results %>%
+    mutate(
+      survived_cohens_d = decision == "KEEP",
+      survived_vif = feature %in% keep_vif,
+      final_status = case_when(
+        !survived_cohens_d ~ "Dropped (Cohen's d)",
+        !survived_vif      ~ "Dropped (VIF)",
+        TRUE               ~ "Selected"
+      )
+    ) %>%
+    select(feature, cohens_d, final_status) %>%
+    arrange(final_status, desc(cohens_d))
+    
+  cat("\nFinal counts for", target_var, ":\n")
+  summary_table %>% count(final_status) %>% print()
+  
+  # Save
+  writeLines(keep_vif, paste0("../data/processed_data/selected_features_", target_var, ".txt"))
+  
+  df_model_final <- df_model %>%
+    select(id_rssd, year, crisis, growth, all_of(keep_vif))
+  
+  write_csv(df_model_final, paste0("../data/processed_data/df_model_", target_var, ".csv"))
+  cat("Saved df_model_", target_var, ".csv with", ncol(df_model_final), "columns\n")
+}
+```
+
+

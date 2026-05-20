@@ -1,0 +1,36 @@
+# Large data files (GitHub 100MB limit)
+data/raw_data/*.dta
+data/processed_data/*.rds
+data/processed_data/*.csv  
+data/processed_data/*.txt
+
+# Model artifacts (too large for git)
+models/
+
+# R workspace
+.RData
+.RDataTmp
+.Rhistory
+.Rproj.user/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+
+# PDF and HTML output (regenerable)
+*.pdf
+*.html
+
+# Python environments and tools
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# IDEs
+.idea/
+.vscode/

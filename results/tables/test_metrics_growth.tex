@@ -1,0 +1,17 @@
+\begin{table}
+\caption{Test-set performance: Growth target.}
+\label{tab:test_metrics_growth}
+\begin{tabular}{lrrrrr}
+\toprule
+model & accuracy & recall & precision & pr_auc & roc_auc \\
+\midrule
+logit & 0.891 & 0.230 & 0.168 & 0.120 & 0.696 \\
+lasso & 0.891 & 0.231 & 0.168 & 0.120 & 0.696 \\
+mundlak & 0.763 & 0.467 & 0.115 & 0.108 & 0.673 \\
+xgb & 0.896 & 0.312 & 0.215 & 0.200 & 0.748 \\
+lgbm & 0.899 & 0.267 & 0.206 & 0.180 & 0.744 \\
+rf & 0.890 & 0.302 & 0.197 & 0.179 & 0.728 \\
+gee_independence & 0.372 & 0.847 & 0.072 & 0.110 & 0.677 \\
+\bottomrule
+\end{tabular}
+\end{table}

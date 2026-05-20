@@ -1,0 +1,522 @@
+---
+title: "Exploratory Data Analysis (EDA)"
+output: pdf_document
+date: "2026-03-11"
+---
+
+<!--
+================================================================================
+01_data_exploration.Rmd
+
+PURPOSE:
+  This notebook performs exploratory data analysis (EDA) on FDIC Call Report
+  data (balance sheets and income statements). It serves as the first step in
+  the bank financial-deterioration prediction pipeline.
+
+WORKFLOW POSITION:
+  1. **01_data_exploration.Rmd** ← (this file)
+  2. 02_data_cleaning.Rmd
+  3. 03_data_preparation.Rmd
+  4. Model training scripts (XGBoost, LightGBM, Random Forest, etc.)
+
+INPUTS:
+  - ../data/raw_data/call-reports-balance-sheets-Jan2026.dta
+  - ../data/raw_data/call-reports-income-statements-Jan2026.dta
+
+OUTPUTS:
+  - ../data/processed_data/df.rds          — merged & lightly trimmed panel
+  - ../data/processed_data/bank_panel.rds  — per-bank quarter counts
+
+KEY ANALYSES:
+  - Data loading, column pruning, and merging of balance-sheet / income-
+    statement datasets
+  - Panel dimensions: number of unique banks and reporting periods
+  - Temporal coverage and bank entry/exit patterns
+  - Bank lifespan distribution
+  - Missingness profile across all variables
+  - Quarterly seasonality in key balance-sheet items (assets, loans, deposits,
+    equity)
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  dev = "png",
+  dpi = 300,
+  fig.path = "../results/figures/01_exploration-"
+)
+```
+
+## 1. Load Required Libraries
+
+```{r load-libraries}
+# tidyverse  — data wrangling (dplyr, tidyr, ggplot2, etc.)
+# lubridate  — date manipulation helpers
+# skimr      — quick summary statistics
+# janitor    — data-cleaning utilities (clean_names, tabyl, etc.)
+# haven      — read Stata (.dta) files
+# readxl     — read Excel (.xlsx) files
+library(tidyverse)
+library(lubridate)
+library(skimr)
+library(janitor)
+library(haven)
+library(readxl)
+```
+
+---
+
+## 2. Load and Inspect the Dataset
+
+Load the two core FDIC Call Report files — **balance sheets** and **income
+statements** — then drop granular or redundant columns that are not needed for
+this analysis.
+
+```{r load-data}
+# Read Stata (.dta) files produced by the FDIC RSSD data pipeline
+df_bs <- read_dta("../data/raw_data/call-reports-balance-sheets-Jan2026.dta")
+df_is <- read_dta("../data/raw_data/call-reports-income-statements-Jan2026.dta")
+```
+
+### 2.1 Column Selection — Drop Redundant / Granular Variables
+
+Many of the original variables are highly granular breakdowns (e.g., time
+deposits by size bucket, maturity band, or average balances) that would add
+noise without clear value at this stage. We retain the broad aggregates and
+drop the detailed sub-components.
+
+```{r drop-columns}
+# ---- Balance-sheet columns to drop ----
+# Categories removed:
+#   • Detailed deposit breakdowns (by size, maturity, domestic/foreign)
+#   • Quarterly average balances (qtr_avg_*)
+#   • Maturity-band breakdowns for securities, loans & leases
+#   • Brokered-deposit detail
+#   • Interest-rate derivative notional amounts
+#   • Administrative / geographic identifiers
+df_bs <- df_bs %>%
+  select(-c(
+    transaction_dep,
+    time_dep_ge100k,
+    time_cd_ge100k,
+    time_dep_lt100k,
+    time_dep_gt250k,
+    time_ge100k_le250k,
+    time_dep_le250k,
+    securities_ac,
+    htmsec_ac,
+    afssec_fv,
+    domestic_dep,
+    foreign_dep,
+    dom_deposit_ib,
+    dom_deposit_nib,
+    for_deposit_ib,
+    for_deposit_nib,
+    time_sav_dep,
+    nontransaction_dep,
+    uninsured_time_dep,
+    nontransaction_sav_dep,
+    tot_sav_dep,
+    qtr_avg_ib_bal_due,
+    qtr_avg_securities,
+    qtr_avg_ust_sec,
+    qtr_avg_mbs,
+    qtr_avg_oth_sec,
+    qtr_avg_trad_ass,
+    qtr_avg_ffrepo_ass,
+    qtr_avg_ln_tot,
+    qtr_avg_ln_re,
+    qtr_avg_ln_rre,
+    qtr_avg_ln_othre,
+    qtr_avg_ln_agr,
+    qtr_avg_ln_ci,
+    qtr_avg_ln_cons,
+    qtr_avg_ln_cc,
+    qtr_avg_ln_othcons,
+    qtr_avg_ln_fgn,
+    qtr_avg_lease,
+    qtr_avg_assets,
+    qtr_avg_trans_dep_dom,
+    qtr_avg_sav_dep_dom,
+    qtr_avg_time_dep_ge100k,
+    qtr_avg_time_dep_gt250k,
+    qtr_avg_time_dep_lt100k,
+    qtr_avg_time_dep_le250k,
+    qtr_avg_time_cd_ge100k,
+    qtr_avg_fgn_dep,
+    qtr_avg_ffrepo_liab,
+    qtr_avg_othbor_liab,
+    ust_sec_1y_3y,
+    ust_sec_3y_5y,
+    ust_sec_5y_15y,
+    ust_sec_over_15y,
+    res_mbs_1y_3y,
+    res_mbs_3y_5y,
+    res_mbs_5y_15y,
+    res_mbs_over_15y,
+    other_mbs_3y_less,
+    other_mbs_3y_more,
+    securities_1y_3y,
+    securities_3y_5y,
+    securities_5y_15y,
+    securities_over_15y,
+    res_loans_1y_3y,
+    res_loans_3y_5y,
+    res_loans_5y_15y,
+    res_loans_over_15y,
+    ln_lease_1y_3y,
+    ln_lease_3y_5y,
+    ln_lease_5y_15y,
+    ln_lease_over_15y,
+    brokered_dep_lt100k,
+    brokered_dep_ge100k,
+    time_dep_lt100k_1y_3y,
+    time_dep_lt100k_over_3yr,
+    time_dep_ge100k_1y_3y,
+    time_dep_ge100k_1y_3y,
+    time_dep_ge100k_over_3yr,
+    time_dep_le250k_1y_3y,
+    time_dep_le250k_over_3yr,
+    time_dep_gt250k_1y_3y,
+    time_dep_gt250k_over_3yr,
+    ust_sec_3mo_less,
+    ust_sec_3mo_12mo,
+    res_mbs_3mo_less,
+    res_mbs_3mo_12mo,
+    securities_3mo_less,
+    securities_3mo_12mo,
+    securities_mat_1y_less,
+    res_loans_3mo_less,
+    res_loans_3mo_12mo,
+    ln_lease_3mo_less,
+    ln_lease_3mo_12mo,
+    ln_lease_mat_1y_less,
+    time_dep_lt100k_3mo_less,
+    time_dep_lt100k_3mo_12mo,
+    time_dep_lt100k_mat_1y_less,
+    time_dep_ge100k_3mo_less,
+    time_dep_ge100k_3mo_12mo,
+    time_dep_le250k_3mo_less,
+    time_dep_le250k_3mo_12mo,
+    time_dep_le250k_mat_1y_less,
+    time_dep_gt250k_3mo_less,
+    time_dep_gt250k_3mo_12mo,
+    tot_gna_deriv_ir,
+    tot_gna_deriv_ir_par,
+    tot_gna_ir_fixed_rate_swap,
+    tot_swaps_int_rate,
+    gross_hedging,
+    tot_gna_ir_float_rate_swap,
+    net_hedging,    
+    entity_type,
+    fgn_call_cntry_cd,
+    fgn_call_fam_id,
+    chtr_type_cd,
+    nm_short,
+    act_prim_cd,
+    zip_cd,
+    city,
+    county_cd,
+    dist_frs,
+    cntry_cd))
+
+# ---- Income-statement columns to drop ----
+# Categories removed:
+#   • Detailed interest income by loan type (real estate, agriculture, etc.)
+#   • Detailed interest expense by deposit type and maturity
+#   • Trading revenue and dividend sub-items
+df_is <- df_is %>%
+  select(-c(
+    ytdint_exp_time_ge100k_dom,
+    ytdint_exp_time_lt100k_dom,
+    ytdint_exp_time_le250k_dom,
+    ytdint_exp_time_gt250k_dom,
+    ytdint_exp_time_dep,
+    ytdtradrev_inc,
+    ytdcommdividend,
+    ytdint_inc_sec_ust,
+    ytdint_inc_sec_mbs,
+    ytdint_inc_sec_oth,
+    ytdint_inc_ln_re,
+    ytdint_inc_ln_rre,
+    ytdint_inc_ln_othre,
+    ytdint_inc_ln_agr,
+    ytdint_inc_ln_ci,
+    ytdint_inc_ln_cc,
+    ytdint_inc_ln_othcons,
+    ytdint_inc_ln_fgn,
+    ytdint_inc_ln_indiv,
+    ytdint_exp_trans_dep_dom,
+    ytdint_exp_savings_dep_dom,
+    ytdint_exp_fgn))
+```
+
+### 2.2 Merge Balance-Sheet and Income-Statement Data
+
+Join the two datasets on `id_rssd` (unique bank identifier) and `date`
+(quarter index) to produce a single unified panel.
+
+```{r merge-bs-is}
+df <- df_bs %>%
+  left_join(
+    df_is,
+    by = c("id_rssd", "date")
+  )
+```
+
+---
+
+## 3. Panel Dimensions
+
+```{r unique-counts}
+# Count the number of distinct banks and reporting periods in the panel
+n_banks   <- n_distinct(df$id_rssd)
+n_periods <- n_distinct(df$date)
+
+cat("Unique banks:  ", n_banks, "\n")
+cat("Unique periods:", n_periods, "\n")
+```
+
+---
+
+## 4. Temporal Coverage
+
+### 4.1 Observations per Quarter
+
+Plot the number of bank-quarter observations over time to identify any
+reporting gaps or structural breaks in the data.
+
+```{r year-coverage}
+df %>%
+  count(date) %>%
+  ggplot(aes(date, n)) +
+  geom_line() +
+  labs(title="Observations per Year",
+       x="Year",
+       y="Number of Bank-Quarter Observations")
+ggsave("../results/figures/01_obs_per_year.png", width=8, height=5)
+```
+
+### 4.2 Create Readable Date Variables
+
+The raw `date` column is an integer encoding where the origin is 1960-Q1.
+Convert it to explicit `year`, `qtr`, and a proper calendar date (`qtr_date`)
+for cleaner plotting and aggregation.
+
+```{r create-year}
+df <- df %>%
+  mutate(
+    year = 1960 + floor(date / 4),              # Extract year from encoded date
+    qtr  = (date %% 4) + 1,                     # Extract quarter (1–4)
+    year_quarter = paste0(year, " Q", qtr),      # Human-readable label
+    qtr_date = make_date(year, qtr * 3, 1) +     # Calendar end-of-quarter date
+               months(1) - days(1)
+  )
+```
+
+### 4.3 Active Banks per Year
+
+Visualise how many distinct banks file reports each year. A declining trend
+may reflect industry consolidation.
+
+```{r banks-per-year}
+df %>%
+  group_by(year) %>%
+  summarise(banks = n_distinct(id_rssd)) %>%
+  ggplot(aes(year, banks)) +
+  geom_line() +
+  labs(title="Number of Active Banks per Year",
+       x="Year",
+       y="Banks")
+ggsave("../results/figures/01_active_banks_per_year.png", width=8, height=5)
+```
+
+---
+
+## 5. Bank Lifespan Analysis
+
+### 5.1 Compute Lifespan per Bank
+
+For each bank, compute its first and last observed year, total years active,
+and the number of quarterly observations on file.
+
+```{r bank-lifespan}
+bank_lifespan <- df %>%
+  group_by(id_rssd) %>%
+  summarise(
+    first_year   = min(year),
+    last_year    = max(year),
+    years_active = last_year - first_year + 1,
+    quarters_obs = n()
+  ) %>%
+  arrange(desc(years_active))
+
+head(bank_lifespan)
+```
+
+### 5.2 Lifespan Distribution
+
+```{r lifespan-distribution}
+bank_lifespan %>%
+  ggplot(aes(years_active)) +
+  geom_histogram(bins = 40) +
+  labs(title="Distribution of Bank Lifespans",
+       x="Years Active",
+       y="Number of Banks")
+```
+
+### 5.3 Lifespan Frequency Table
+
+```{r lifespan-count}
+bank_lifespan %>%
+  count(years_active) %>%
+  arrange(years_active)
+```
+
+### 5.4 Panel Balance Check
+
+Summarise the distribution of the number of quarters observed per bank.
+A perfectly balanced panel would show a single value.
+
+```{r panel-balance}
+bank_panel <- df %>%
+  group_by(id_rssd) %>%
+  summarise(quarters = n())
+
+summary(bank_panel$quarters)
+```
+
+---
+
+## 6. Bank Entry and Exit Patterns
+
+### 6.1 Entry (First Observation Year)
+
+```{r entry-exit}
+bank_lifespan %>%
+  ggplot(aes(first_year)) +
+  geom_histogram(bins = 50) +
+  labs(title="Bank Entry Over Time")
+```
+
+### 6.2 Exit (Last Observation Year)
+
+```{r exits}
+bank_lifespan %>%
+  ggplot(aes(last_year)) +
+  geom_histogram(bins = 50) +
+  labs(title="Bank Exit Over Time")
+```
+
+---
+
+## 7. Missingness Profile
+
+Compute the fraction of missing values for every column and display the 50
+worst offenders. High missingness may indicate variables that are only
+collected in certain periods or for certain charter types.
+
+```{r missing}
+df %>%
+  summarise(across(everything(), ~mean(is.na(.)))) %>%
+  pivot_longer(everything()) %>%
+  arrange(desc(value)) %>%
+  head(50)
+```
+
+---
+
+## 8. Seasonality Analysis — Assets, Loans, Deposits, Equity
+
+Investigate whether key balance-sheet items show systematic quarterly
+patterns (e.g., window-dressing effects at year-end).
+
+### 8.1 Subset Key Variables
+
+```{r df-key-vars}
+# Create a focused dataframe with only the key balance-sheet items
+df_key <- df %>%
+  select(id_rssd, year, qtr, assets, ln_tot, deposits, equity) %>%
+  rename(loans = ln_tot) %>%
+  mutate(qtr_label = factor(paste0("Q", qtr), levels = paste0("Q", 1:4)))
+```
+
+### 8.2 Aggregate Medians by Year-Quarter
+
+```{r aggregate-by-quarter}
+# Aggregate: median across all banks for each year-quarter
+# Median is robust to outliers created by very large / very small banks
+df_key_agg <- df_key %>%
+  group_by(year, qtr, qtr_label) %>%
+  summarise(
+    assets   = median(assets,   na.rm = TRUE),
+    loans    = median(loans,    na.rm = TRUE),
+    deposits = median(deposits, na.rm = TRUE),
+    equity   = median(equity,   na.rm = TRUE),
+    .groups  = "drop"
+  )
+```
+
+### 8.3 Quarterly Seasonality Box-Plots
+
+Box-plots of median values grouped by quarter. Differences in median or
+spread across quarters would indicate seasonality.
+
+```{r seasonality-boxplots, fig.width=10, fig.height=8}
+# Pivot to long form for faceted plotting
+df_key_long <- df_key_agg %>%
+  pivot_longer(cols = c(assets, loans, deposits, equity),
+               names_to  = "variable",
+               values_to = "value") %>%
+  mutate(variable = factor(variable,
+                           levels = c("assets", "loans", "deposits", "equity"),
+                           labels = c("Assets", "Loans", "Deposits", "Equity")))
+
+# Box-plots: distribution of median values by quarter
+ggplot(df_key_long, aes(x = qtr_label, y = value / 1e3, fill = qtr_label)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title    = "Quarterly Seasonality — Key Balance-Sheet Variables",
+       subtitle = "Distribution of yearly median values by quarter (across all years)",
+       x = "Quarter", y = "Value (thousands $)",
+       fill = "Quarter") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+### 8.4 Median Time-Series Coloured by Quarter
+
+Overlay quarterly time-series to visually detect persistent gaps between
+quarters (a hallmark of seasonality).
+
+```{r seasonality-lines, fig.width=10, fig.height=8}
+# Line chart: median over time coloured by quarter
+ggplot(df_key_long, aes(x = year, y = value / 1e3, colour = qtr_label, group = qtr_label)) +
+  geom_line(alpha = 0.8, linewidth = 0.6) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title    = "Median Values Over Time by Quarter",
+       subtitle = "Each line represents one quarter — gaps between lines suggest seasonality",
+       x = "Year", y = "Value (thousands $)",
+       colour = "Quarter") +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+## 9. Save Intermediate Outputs
+
+Persist the merged panel (`df`) and the bank-level quarter counts
+(`bank_panel`) for use in the next notebook (`02_data_cleaning.Rmd`).
+
+```{r save-outputs}
+saveRDS(df, "../data/processed_data/df.rds")
+saveRDS(bank_panel, "../data/processed_data/bank_panel.rds")
+```
+
+
