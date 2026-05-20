@@ -7,7 +7,7 @@ echo "============================================================"
 
 # 1. Environment Setup
 export PYTHONPATH=$PYTHONPATH:$(pwd)/code
-mkdir -p results/figures results/tables results/metrics results/logs
+mkdir -p results/figures results/tables results/metrics results/logs data/processed_data data/splits models
 
 # 1.1 System Prerequisites (Homebrew, Python3, R, Pandoc)
 echo "Checking system prerequisites..."
